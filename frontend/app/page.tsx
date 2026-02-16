@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useAuthStore } from '@/lib/store';
 import AuthForm from '@/components/AuthForm';
 import ChatList from '@/components/ChatList';
@@ -15,11 +15,12 @@ export default function Home() {
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
   const [workflowData, setWorkflowData] = useState<string | null>(null);
   const [currentMessageId, setCurrentMessageId] = useState<number | null>(null);
+  const [isOwnerOfSelected, setIsOwnerOfSelected] = useState(true);
 
-  const handleWorkflowUpdate = (data: string | null, messageId?: number) => {
+  const handleWorkflowUpdate = useCallback((data: string | null, messageId?: number) => {
     setWorkflowData(data);
     if (messageId) setCurrentMessageId(messageId);
-  };
+  }, []);
 
   const handlePositionChange = async (updatedWorkflow: string) => {
     if (currentMessageId) {
@@ -31,6 +32,15 @@ export default function Home() {
     }
   };
 
+  const handleSelectChat = useCallback((chatId: number | null) => {
+    setSelectedChatId(chatId);
+    setIsOwnerOfSelected(true);
+  }, []);
+
+  const handleSelectSharedChat = useCallback((chatId: number, ownerUsername: string) => {
+    setSelectedChatId(chatId);
+    setIsOwnerOfSelected(false);
+  }, []);
 
   useEffect(() => {
     checkAuth();
@@ -68,8 +78,9 @@ export default function Home() {
       <div className={styles.mainContent}>
         <div className={styles.chatListSection}>
           <ChatList
-            onSelectChat={setSelectedChatId}
+            onSelectChat={handleSelectChat}
             selectedChatId={selectedChatId}
+            onSelectSharedChat={handleSelectSharedChat}
           />
         </div>
 
@@ -77,6 +88,7 @@ export default function Home() {
           <ChatWindow
             chatId={selectedChatId}
             onWorkflowUpdate={handleWorkflowUpdate}
+            isOwner={isOwnerOfSelected}
           />
         </div>
 

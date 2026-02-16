@@ -1,27 +1,103 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { chatApi, Message } from '@/lib/api';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { chatApi, Message, chatWS, OnlineUser, WSMessage } from '@/lib/api';
+import ShareDialog from './ShareDialog';
+import OnlineIndicator from './OnlineIndicator';
 import styles from './ChatWindow.module.css';
 
 interface ChatWindowProps {
   chatId: number | null;
   onWorkflowUpdate: (workflowData: string | null, messageId?: number) => void;
+  isOwner?: boolean;
 }
 
-export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps) {
+export default function ChatWindow({ chatId, onWorkflowUpdate, isOwner = true }: ChatWindowProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showShareDialog, setShowShareDialog] = useState(false);
+  const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
+  const [typingUsers, setTypingUsers] = useState<string[]>([]);
+  const [processingInfo, setProcessingInfo] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (chatId) {
       loadMessages();
+      chatWS.connect(chatId);
     } else {
       setMessages([]);
       onWorkflowUpdate(null);
+      chatWS.disconnect();
+      setOnlineUsers([]);
+      setTypingUsers([]);
+      setProcessingInfo(null);
     }
+
+    return () => {
+      chatWS.disconnect();
+    };
+  }, [chatId]);
+
+  useEffect(() => {
+    const unsubPresence = chatWS.on('presence', (data: WSMessage) => {
+      setOnlineUsers(data.users || []);
+    });
+
+    const unsubNewMessage = chatWS.on('new_message', (data: WSMessage) => {
+      if (data.chat_id === chatId) {
+        loadMessages();
+      }
+    });
+
+    const unsubWorkflow = chatWS.on('workflow_update', (data: WSMessage) => {
+      if (data.chat_id === chatId && data.workflow_data) {
+        onWorkflowUpdate(data.workflow_data, data.message_id);
+      }
+    });
+
+    const unsubUndo = chatWS.on('undo', (data: WSMessage) => {
+      if (data.chat_id === chatId) {
+        loadMessages();
+        onWorkflowUpdate(data.workflow_data || null);
+      }
+    });
+
+    const unsubTyping = chatWS.on('typing', (data: WSMessage) => {
+      if (data.is_typing) {
+        setTypingUsers(prev => {
+          if (!prev.includes(data.username)) return [...prev, data.username];
+          return prev;
+        });
+        setTimeout(() => {
+          setTypingUsers(prev => prev.filter(u => u !== data.username));
+        }, 3000);
+      } else {
+        setTypingUsers(prev => prev.filter(u => u !== data.username));
+      }
+    });
+
+    const unsubProcessing = chatWS.on('processing', (data: WSMessage) => {
+      if (data.chat_id !== chatId) return;
+      if (data.status === 'started') {
+        setProcessingInfo(`Processing ${data.processed_by_username}'s message...`);
+      } else if (data.status === 'queued') {
+        setProcessingInfo(data.message || 'Waiting for another request to finish...');
+      } else if (data.status === 'done') {
+        setProcessingInfo(null);
+      }
+    });
+
+    return () => {
+      unsubPresence();
+      unsubNewMessage();
+      unsubWorkflow();
+      unsubUndo();
+      unsubTyping();
+      unsubProcessing();
+    };
   }, [chatId]);
 
   useEffect(() => {
@@ -39,7 +115,6 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
       const chat = await chatApi.getChat(chatId);
       setMessages(chat.messages);
       
-      // Update workflow with latest assistant message that has workflow data
       const lastWorkflow = [...chat.messages]
         .reverse()
         .find(msg => msg.role === 'assistant' && msg.workflow_data);
@@ -49,15 +124,25 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
     }
   };
 
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    chatWS.sendTyping(true);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      chatWS.sendTyping(false);
+    }, 2000);
+  };
+
   const handleSend = async () => {
     if (!input.trim() || !chatId || loading) return;
 
     const userMessage = input;
     setInput('');
     setLoading(true);
+    chatWS.sendTyping(false);
 
     const tempUserMessage: Message = {
-      id: Date.now(), // Temporary ID
+      id: Date.now(),
       chat_id: chatId,
       role: 'user',
       content: userMessage,
@@ -67,15 +152,13 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
 
     try {
       const response = await chatApi.sendMessage(chatId, userMessage);
-      await loadMessages(); // This will reload with real data from server
+      await loadMessages();
       
-      // Update workflow if present
       if (response.workflow_data) {
         onWorkflowUpdate(response.workflow_data, response.id);
       }
     } catch (error) {
       console.error('Failed to send message:', error);
-      // Remove the optimistic message on error
       setMessages(prev => prev.filter(msg => msg.id !== tempUserMessage.id));
     } finally {
       setLoading(false);
@@ -95,9 +178,8 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
     setLoading(true);
     try {
       const result = await chatApi.undoWorkflow(chatId);
-      await loadMessages(); // Reload messages after undo
+      await loadMessages();
       
-      // Update workflow to previous version or null
       if (result.workflow_data) {
         onWorkflowUpdate(result.workflow_data);
       } else {
@@ -124,6 +206,17 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
 
   return (
     <div className={styles.container}>
+      <div className={styles.chatHeader}>
+        <OnlineIndicator users={onlineUsers} typingUsers={typingUsers} />
+        <button
+          onClick={() => setShowShareDialog(true)}
+          className={styles.shareButton}
+          title="Share this chat"
+        >
+          Share
+        </button>
+      </div>
+
       <div className={styles.messages}>
         {messages.map((message) => (
           <div
@@ -151,6 +244,12 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
             </div>
           </div>
         )}
+        {processingInfo && !loading && (
+          <div className={styles.processingBanner}>
+            <div className={styles.processingDot} />
+            {processingInfo}
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
@@ -161,11 +260,11 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
           disabled={loading || messages.length < 2}
           title="Undo last change"
         >
-          ↶ Undo
+          &#x21B6; Undo
         </button>
         <textarea
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={handleInputChange}
           onKeyDown={handleKeyPress}
           placeholder="Describe the workflow you need..."
           className={styles.input}
@@ -180,6 +279,14 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
           Send
         </button>
       </div>
+
+      {showShareDialog && (
+        <ShareDialog
+          chatId={chatId}
+          isOwner={isOwner}
+          onClose={() => setShowShareDialog(false)}
+        />
+      )}
     </div>
   );
 }

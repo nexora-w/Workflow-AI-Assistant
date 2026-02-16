@@ -1,21 +1,30 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from datetime import timedelta
-from typing import List
+from sqlalchemy import or_
+from datetime import timedelta, datetime
+from typing import List, Optional, Dict, Set
 import json
 import os
 import re
+import asyncio
 from dotenv import load_dotenv
 
-from database import get_db, init_db, User, Chat, Message
+from database import (
+    get_db, init_db, User, Chat, Message, ChatCollaborator,
+    CollaboratorRole, SessionLocal, WorkflowState, WorkflowOperation, WorkflowSnapshot
+)
 from schemas import (
     UserCreate, UserLogin, UserResponse, Token,
-    ChatCreate, ChatResponse, MessageCreate, MessageResponse, ChatWithMessages
+    ChatCreate, ChatResponse, MessageCreate, MessageResponse, ChatWithMessages,
+    CollaboratorAdd, CollaboratorResponse, SharedChatResponse, UserSearchResponse,
+    WorkflowOperationRequest, WorkflowOperationResponse, WorkflowStateResponse,
+    VersionTimelineResponse, VersionEntry, RevertRequest, RevertResponse
 )
+from conflict_resolver import Operation, resolve as resolve_conflict
 from auth import (
     verify_password, get_password_hash, create_access_token,
-    get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES
+    get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, SECRET_KEY, ALGORITHM
 )
 
 load_dotenv()
@@ -40,6 +49,172 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     init_db()
+
+
+# ============================================================
+# WebSocket Connection Manager
+# ============================================================
+
+class ConnectionManager:
+    """Manages WebSocket connections per chat room with presence tracking."""
+    
+    def __init__(self):
+        self.active_connections: Dict[int, Dict[int, WebSocket]] = {}
+        self.user_info: Dict[int, Dict[int, dict]] = {}
+    
+    async def connect(self, websocket: WebSocket, chat_id: int, user_id: int, username: str):
+        await websocket.accept()
+        if chat_id not in self.active_connections:
+            self.active_connections[chat_id] = {}
+            self.user_info[chat_id] = {}
+        self.active_connections[chat_id][user_id] = websocket
+        self.user_info[chat_id][user_id] = {"user_id": user_id, "username": username}
+        await self.broadcast_presence(chat_id)
+    
+    def disconnect(self, chat_id: int, user_id: int):
+        if chat_id in self.active_connections:
+            self.active_connections[chat_id].pop(user_id, None)
+            self.user_info[chat_id].pop(user_id, None)
+            if not self.active_connections[chat_id]:
+                del self.active_connections[chat_id]
+                del self.user_info[chat_id]
+    
+    async def broadcast_to_chat(self, chat_id: int, message: dict, exclude_user: int = None):
+        if chat_id not in self.active_connections:
+            return
+        disconnected = []
+        for uid, ws in self.active_connections[chat_id].items():
+            if uid == exclude_user:
+                continue
+            try:
+                await ws.send_json(message)
+            except Exception:
+                disconnected.append(uid)
+        for uid in disconnected:
+            self.disconnect(chat_id, uid)
+    
+    async def broadcast_presence(self, chat_id: int):
+        if chat_id not in self.user_info:
+            return
+        presence_data = {
+            "type": "presence",
+            "chat_id": chat_id,
+            "users": list(self.user_info[chat_id].values())
+        }
+        await self.broadcast_to_chat(chat_id, presence_data)
+    
+    def get_online_users(self, chat_id: int) -> list:
+        if chat_id in self.user_info:
+            return list(self.user_info[chat_id].values())
+        return []
+
+
+manager = ConnectionManager()
+
+
+# ============================================================
+# Per-Chat Lock Manager (serializes concurrent message processing)
+# ============================================================
+
+class ChatLockManager:
+    """
+    Provides one asyncio.Lock per chat_id so that only one message
+    is processed at a time within a given chat.  Locks are created
+    lazily and cleaned up when no longer held.
+    """
+    
+    def __init__(self):
+        self._locks: Dict[int, asyncio.Lock] = {}
+        self._waiters: Dict[int, int] = {}
+    
+    def _get_lock(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self._locks:
+            self._locks[chat_id] = asyncio.Lock()
+            self._waiters[chat_id] = 0
+        return self._locks[chat_id]
+    
+    async def acquire(self, chat_id: int, user_id: int, username: str):
+        lock = self._get_lock(chat_id)
+        self._waiters[chat_id] += 1
+        
+        if lock.locked():
+            await manager.broadcast_to_chat(chat_id, {
+                "type": "processing",
+                "chat_id": chat_id,
+                "status": "queued",
+                "queued_by": user_id,
+                "queued_by_username": username,
+                "message": f"{username}'s request is waiting — another message is being processed"
+            }, exclude_user=None)
+        
+        await lock.acquire()
+        
+        await manager.broadcast_to_chat(chat_id, {
+            "type": "processing",
+            "chat_id": chat_id,
+            "status": "started",
+            "processed_by": user_id,
+            "processed_by_username": username,
+            "message": f"Processing {username}'s message..."
+        }, exclude_user=user_id)
+    
+    async def release(self, chat_id: int):
+        if chat_id in self._locks:
+            self._waiters[chat_id] -= 1
+            self._locks[chat_id].release()
+            
+            if self._waiters[chat_id] <= 0:
+                del self._locks[chat_id]
+                del self._waiters[chat_id]
+        
+        await manager.broadcast_to_chat(chat_id, {
+            "type": "processing",
+            "chat_id": chat_id,
+            "status": "done"
+        })
+
+
+chat_lock_manager = ChatLockManager()
+
+
+# ============================================================
+# Helper: Check if user has access to a chat (owner or collaborator)
+# ============================================================
+
+def get_chat_with_access(
+    chat_id: int, 
+    user: User, 
+    db: Session, 
+    require_role: str = None
+) -> Chat:
+    """
+    Returns the chat if the user is the owner or a collaborator.
+    If require_role is set, collaborators must have that role (e.g. 'editor').
+    Raises 404 if chat doesn't exist or user has no access.
+    """
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    if chat.user_id == user.id:
+        return chat
+    
+    collab = db.query(ChatCollaborator).filter(
+        ChatCollaborator.chat_id == chat_id,
+        ChatCollaborator.user_id == user.id
+    ).first()
+    
+    if not collab:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    if require_role and collab.role != require_role:
+        raise HTTPException(
+            status_code=403, 
+            detail=f"You need '{require_role}' access to perform this action"
+        )
+    
+    return chat
+
 
 # Authentication endpoints
 @app.post("/auth/register", response_model=UserResponse)
@@ -94,6 +269,31 @@ def get_chats(current_user: User = Depends(get_current_user), db: Session = Depe
     chats = db.query(Chat).filter(Chat.user_id == current_user.id).order_by(Chat.updated_at.desc()).all()
     return chats
 
+@app.get("/chats/shared", response_model=List[SharedChatResponse])
+def get_shared_chats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get all chats that have been shared with the current user."""
+    collabs = db.query(ChatCollaborator).filter(
+        ChatCollaborator.user_id == current_user.id
+    ).all()
+    
+    result = []
+    for collab in collabs:
+        chat = db.query(Chat).filter(Chat.id == collab.chat_id).first()
+        if chat:
+            owner = db.query(User).filter(User.id == chat.user_id).first()
+            result.append(SharedChatResponse(
+                id=chat.id,
+                title=chat.title,
+                created_at=chat.created_at,
+                updated_at=chat.updated_at,
+                owner_id=chat.user_id,
+                owner_username=owner.username if owner else "Unknown",
+                my_role=collab.role
+            ))
+    
+    result.sort(key=lambda x: x.updated_at, reverse=True)
+    return result
+
 @app.post("/chats", response_model=ChatResponse)
 def create_chat(chat: ChatCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     new_chat = Chat(
@@ -107,16 +307,14 @@ def create_chat(chat: ChatCreate, current_user: User = Depends(get_current_user)
 
 @app.get("/chats/{chat_id}", response_model=ChatWithMessages)
 def get_chat(chat_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+    chat = get_chat_with_access(chat_id, current_user, db)
     return chat
 
 @app.delete("/chats/{chat_id}")
 def delete_chat(chat_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
     if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+        raise HTTPException(status_code=404, detail="Chat not found or you are not the owner")
     db.delete(chat)
     db.commit()
     return {"message": "Chat deleted successfully"}
@@ -129,32 +327,51 @@ async def create_message(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Verify chat belongs to user
-    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+    chat = get_chat_with_access(chat_id, current_user, db, require_role=None)
     
-    # Save user message
-    user_message = Message(
-        chat_id=chat_id,
-        role="user",
-        content=message.content
-    )
-    db.add(user_message)
-    db.commit()
-    db.refresh(user_message)
+    # Acquire per-chat lock — serializes concurrent messages so the AI
+    # always sees the full conversation history including prior requests.
+    await chat_lock_manager.acquire(chat_id, current_user.id, current_user.username)
     
-    # Update chat title if it's still "New Conversation" and this is the first message
-    if chat.title == "New Conversation":
-        message_count = db.query(Message).filter(Message.chat_id == chat_id).count()
-        if message_count == 1:  # First message
-            # Generate a short title from the user's message
-            title = message.content[:50]  # Take first 50 chars of message
-            if len(message.content) > 50:
-                title = title.rsplit(' ', 1)[0] + "..."  # Cut at last word
-            chat.title = title
-            db.commit()
-    
+    try:
+        # Re-fetch the chat inside the lock so we see any changes
+        # committed by a previously-queued request.
+        db.expire_all()
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        
+        # Save user message
+        user_message = Message(
+            chat_id=chat_id,
+            role="user",
+            content=message.content
+        )
+        db.add(user_message)
+        db.commit()
+        db.refresh(user_message)
+        
+        # Update chat title if it's still "New Conversation" and this is the first message
+        if chat.title == "New Conversation":
+            message_count = db.query(Message).filter(Message.chat_id == chat_id).count()
+            if message_count == 1:  # First message
+                title = message.content[:50]
+                if len(message.content) > 50:
+                    title = title.rsplit(' ', 1)[0] + "..."
+                chat.title = title
+                db.commit()
+        
+        return await _generate_ai_response(chat_id, message, user_message, current_user, db)
+    finally:
+        await chat_lock_manager.release(chat_id)
+
+
+async def _generate_ai_response(
+    chat_id: int,
+    message: MessageCreate,
+    user_message: Message,
+    current_user: User,
+    db: Session
+) -> Message:
+    """Separated AI response logic so the lock wrapper stays clean."""
     # Generate AI response
     try:
         from openai import OpenAI
@@ -286,6 +503,8 @@ async def create_message(
                 db.add(ai_message)
                 db.commit()
                 db.refresh(ai_message)
+                if ai_message.workflow_data:
+                    _ensure_workflow_state(chat_id, ai_message.workflow_data, current_user.id, db)
                 return ai_message
             else:
                 raise Exception("Empty response from AI model and no previous workflow available")
@@ -388,6 +607,39 @@ async def create_message(
         db.commit()
         db.refresh(ai_message)
         
+        if ai_message.workflow_data:
+            _ensure_workflow_state(chat_id, ai_message.workflow_data, current_user.id, db)
+        
+        # Get current workflow version for broadcast
+        ws_state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+        
+        # Broadcast new messages to all connected users in this chat
+        await manager.broadcast_to_chat(chat_id, {
+            "type": "new_message",
+            "chat_id": chat_id,
+            "sender_id": current_user.id,
+            "sender_username": current_user.username,
+            "workflow_version": ws_state.version if ws_state else None,
+            "messages": [
+                {
+                    "id": user_message.id,
+                    "chat_id": chat_id,
+                    "role": "user",
+                    "content": user_message.content,
+                    "workflow_data": None,
+                    "created_at": user_message.created_at.isoformat()
+                },
+                {
+                    "id": ai_message.id,
+                    "chat_id": chat_id,
+                    "role": "assistant",
+                    "content": ai_message.content,
+                    "workflow_data": ai_message.workflow_data,
+                    "created_at": ai_message.created_at.isoformat()
+                }
+            ]
+        }, exclude_user=current_user.id)
+        
         return ai_message
     except Exception as e:
         # If OpenAI fails, an error log is printed, then a fallback response is returned
@@ -417,30 +669,257 @@ async def create_message(
         db.commit()
         db.refresh(ai_message)
         
+        if ai_message.workflow_data:
+            _ensure_workflow_state(chat_id, ai_message.workflow_data, current_user.id, db)
+        
         return ai_message
     
 # Endpoint to update workflow data and position for a message
 @app.patch("/messages/{message_id}/workflow")
-def update_workflow(
+async def update_workflow(
     message_id: int,
     workflow_data: dict,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Get the message
-    message = db.query(Message).join(Chat).filter(
-        Message.id == message_id,
-        Chat.user_id == current_user.id
-    ).first()
-    
-    if not message:
+    msg = db.query(Message).filter(Message.id == message_id).first()
+    if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     
-    # Update workflow data
-    message.workflow_data = workflow_data.get('workflow_data')
+    chat = get_chat_with_access(msg.chat_id, current_user, db)
+    
+    new_data = workflow_data.get('workflow_data')
+    msg.workflow_data = new_data
     db.commit()
     
+    await manager.broadcast_to_chat(msg.chat_id, {
+        "type": "workflow_update",
+        "chat_id": msg.chat_id,
+        "message_id": message_id,
+        "workflow_data": new_data,
+        "updated_by": current_user.id,
+        "updated_by_username": current_user.username
+    }, exclude_user=current_user.id)
+    
     return {"message": "Workflow updated successfully"}
+
+
+# ============================================================
+# Version-Based Conflict Resolution Endpoints
+# ============================================================
+
+def _ensure_workflow_state(
+    chat_id: int, data: str, user_id: int, db: Session,
+    description: str = "AI-generated workflow"
+) -> WorkflowState:
+    """
+    Create or update WorkflowState and save a snapshot.
+    If the pointer was in the middle of the history (user had undone),
+    truncate future snapshots before appending — git-style branching.
+    """
+    state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+    if state:
+        # Truncate any snapshots ahead of the current pointer
+        db.query(WorkflowSnapshot).filter(
+            WorkflowSnapshot.chat_id == chat_id,
+            WorkflowSnapshot.version > state.current_version
+        ).delete(synchronize_session=False)
+        
+        state.version += 1
+        state.current_version = state.version
+        state.data = data
+        state.updated_by = user_id
+    else:
+        state = WorkflowState(
+            chat_id=chat_id,
+            version=1,
+            current_version=1,
+            data=data,
+            updated_by=user_id
+        )
+        db.add(state)
+        db.flush()
+    
+    snapshot = WorkflowSnapshot(
+        chat_id=chat_id,
+        version=state.version,
+        data=data,
+        description=description,
+        created_by=user_id
+    )
+    db.add(snapshot)
+    db.commit()
+    db.refresh(state)
+    return state
+
+
+@app.get("/chats/{chat_id}/workflow/state", response_model=WorkflowStateResponse)
+def get_workflow_state(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the current versioned workflow state for a chat.
+    Clients use the returned version as base_version for subsequent operations.
+    """
+    get_chat_with_access(chat_id, current_user, db)
+    
+    state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+    if not state:
+        last_workflow_msg = db.query(Message).filter(
+            Message.chat_id == chat_id,
+            Message.role == "assistant",
+            Message.workflow_data.isnot(None)
+        ).order_by(Message.created_at.desc()).first()
+        
+        if not last_workflow_msg:
+            raise HTTPException(status_code=404, detail="No workflow exists for this chat")
+        
+        state = _ensure_workflow_state(
+            chat_id, last_workflow_msg.workflow_data, current_user.id, db
+        )
+    
+    return WorkflowStateResponse(
+        chat_id=chat_id,
+        version=state.current_version,
+        max_version=state.version,
+        data=state.data,
+        updated_at=state.updated_at,
+        updated_by=state.updated_by
+    )
+
+
+@app.post("/chats/{chat_id}/workflow/operations", response_model=WorkflowOperationResponse)
+async def apply_workflow_operations(
+    chat_id: int,
+    request: WorkflowOperationRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Apply operations to a workflow with version-based conflict resolution.
+    
+    - If base_version matches server → apply directly.
+    - If behind but operations don't conflict → auto-merge.
+    - If conflicting → reject with conflict details + latest state.
+    """
+    get_chat_with_access(chat_id, current_user, db)
+    
+    state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+    if not state:
+        last_workflow_msg = db.query(Message).filter(
+            Message.chat_id == chat_id,
+            Message.role == "assistant",
+            Message.workflow_data.isnot(None)
+        ).order_by(Message.created_at.desc()).first()
+        
+        if not last_workflow_msg:
+            raise HTTPException(status_code=404, detail="No workflow exists for this chat")
+        
+        state = _ensure_workflow_state(
+            chat_id, last_workflow_msg.workflow_data, current_user.id, db
+        )
+    
+    incoming_ops = [
+        Operation(op_type=op.op_type, payload=op.payload)
+        for op in request.operations
+    ]
+    
+    op_log = []
+    if request.base_version < state.version:
+        op_records = db.query(WorkflowOperation).filter(
+            WorkflowOperation.chat_id == chat_id,
+            WorkflowOperation.version_after > request.base_version,
+            WorkflowOperation.version_after <= state.version,
+            WorkflowOperation.status == "applied"
+        ).order_by(WorkflowOperation.version_after.asc()).all()
+        
+        op_log = [{"op_data": r.op_data} for r in op_records]
+    
+    result = resolve_conflict(
+        current_data=state.data,
+        current_version=state.version,
+        base_version=request.base_version,
+        incoming_ops=incoming_ops,
+        op_log=op_log
+    )
+    
+    if result.status == "conflict":
+        return WorkflowOperationResponse(
+            status="conflict",
+            version=state.current_version,
+            data=state.data,
+            conflicts=result.conflicts
+        )
+    
+    # Truncate future snapshots if pointer was in the middle
+    db.query(WorkflowSnapshot).filter(
+        WorkflowSnapshot.chat_id == chat_id,
+        WorkflowSnapshot.version > state.current_version
+    ).delete(synchronize_session=False)
+    
+    state.data = result.new_data
+    state.version = result.new_version
+    state.current_version = result.new_version
+    state.updated_by = current_user.id
+    
+    op_desc = ", ".join(op.op_type for op in incoming_ops)
+    
+    op_record = WorkflowOperation(
+        chat_id=chat_id,
+        user_id=current_user.id,
+        version_before=request.base_version,
+        version_after=result.new_version,
+        op_type=op_desc,
+        op_data=json.dumps([
+            {"op_type": op.op_type, "payload": op.payload}
+            for op in incoming_ops
+        ]),
+        status=result.status
+    )
+    db.add(op_record)
+    
+    snapshot = WorkflowSnapshot(
+        chat_id=chat_id,
+        version=result.new_version,
+        data=result.new_data,
+        description=f"{current_user.username}: {op_desc}",
+        created_by=current_user.id
+    )
+    db.add(snapshot)
+    
+    last_msg = db.query(Message).filter(
+        Message.chat_id == chat_id,
+        Message.role == "assistant",
+        Message.workflow_data.isnot(None)
+    ).order_by(Message.created_at.desc()).first()
+    if last_msg:
+        last_msg.workflow_data = result.new_data
+    
+    db.commit()
+    
+    await manager.broadcast_to_chat(chat_id, {
+        "type": "workflow_op",
+        "chat_id": chat_id,
+        "version": result.new_version,
+        "data": result.new_data,
+        "operations": [
+            {"op_type": op.op_type, "payload": op.payload}
+            for op in incoming_ops
+        ],
+        "applied_by": current_user.id,
+        "applied_by_username": current_user.username,
+        "status": result.status
+    }, exclude_user=current_user.id)
+    
+    return WorkflowOperationResponse(
+        status=result.status,
+        version=result.new_version,
+        data=result.new_data,
+        conflicts=[]
+    )
+
 
 # Endpoint for workflow history and undo
 @app.get("/chats/{chat_id}/workflows/history")
@@ -450,10 +929,7 @@ def get_workflow_history(
     db: Session = Depends(get_db)
 ):
     """Get all workflow versions in chronological order"""
-    # Verify chat belongs to user
-    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+    chat = get_chat_with_access(chat_id, current_user, db)
     
     # Get all messages with workflows
     messages = db.query(Message).filter(
@@ -469,42 +945,432 @@ def get_workflow_history(
     } for msg in messages]
 
 @app.post("/chats/{chat_id}/workflows/undo")
-def undo_workflow(
+async def undo_workflow(
     chat_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Revert to the previous workflow by removing the last assistant message"""
-    # Verify chat belongs to user
-    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+    chat = get_chat_with_access(chat_id, current_user, db)
     
-    # Get the last two messages (user request + AI response)
-    last_messages = db.query(Message).filter(
-        Message.chat_id == chat_id
-    ).order_by(Message.created_at.desc()).limit(2).all()
+    # Lock so undo cannot race with an in-flight message generation
+    await chat_lock_manager.acquire(chat_id, current_user.id, current_user.username)
+    try:
+        db.expire_all()
+        
+        last_messages = db.query(Message).filter(
+            Message.chat_id == chat_id
+        ).order_by(Message.created_at.desc()).limit(2).all()
+        
+        if len(last_messages) < 2:
+            raise HTTPException(status_code=400, detail="No messages to undo")
+        
+        for msg in last_messages:
+            db.delete(msg)
+        
+        db.commit()
+        
+        prev_workflow = db.query(Message).filter(
+            Message.chat_id == chat_id,
+            Message.role == "assistant",
+            Message.workflow_data.isnot(None)
+        ).order_by(Message.created_at.desc()).first()
+        
+        result = {
+            "message": "Undone successfully",
+            "workflow_data": prev_workflow.workflow_data if prev_workflow else None
+        }
+        
+        await manager.broadcast_to_chat(chat_id, {
+            "type": "undo",
+            "chat_id": chat_id,
+            "undone_by": current_user.id,
+            "undone_by_username": current_user.username,
+            "workflow_data": result["workflow_data"]
+        }, exclude_user=current_user.id)
+        
+        return result
+    finally:
+        await chat_lock_manager.release(chat_id)
+
+
+# ============================================================
+# Version Control Endpoints (undo / redo / revert / timeline)
+# ============================================================
+
+@app.get("/chats/{chat_id}/workflow/versions", response_model=VersionTimelineResponse)
+def get_version_timeline(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Return every saved version of the workflow so the client can
+    render a timeline and jump to any point.
+    """
+    get_chat_with_access(chat_id, current_user, db)
     
-    if len(last_messages) < 2:
-        raise HTTPException(status_code=400, detail="No messages to undo")
+    state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+    cur_ver = state.current_version if state else 0
     
-    # Delete the last two messages
-    for msg in last_messages:
-        db.delete(msg)
+    snapshots = db.query(WorkflowSnapshot).filter(
+        WorkflowSnapshot.chat_id == chat_id
+    ).order_by(WorkflowSnapshot.version.asc()).all()
     
-    db.commit()
+    entries: List[VersionEntry] = []
+    for snap in snapshots:
+        creator = db.query(User).filter(User.id == snap.created_by).first() if snap.created_by else None
+        entries.append(VersionEntry(
+            version=snap.version,
+            description=snap.description,
+            created_by=snap.created_by,
+            created_by_username=creator.username if creator else None,
+            created_at=snap.created_at,
+            is_current=(snap.version == cur_ver)
+        ))
     
-    # Get the previous workflow (if any)
-    prev_workflow = db.query(Message).filter(
+    return VersionTimelineResponse(
+        chat_id=chat_id,
+        current_version=cur_ver,
+        versions=entries
+    )
+
+
+@app.post("/chats/{chat_id}/workflow/revert", response_model=RevertResponse)
+async def revert_to_version(
+    chat_id: int,
+    request: RevertRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Move the current_version pointer to an existing snapshot.
+    No new snapshots are created — undo/redo just moves the pointer.
+    """
+    get_chat_with_access(chat_id, current_user, db)
+    
+    snapshot = db.query(WorkflowSnapshot).filter(
+        WorkflowSnapshot.chat_id == chat_id,
+        WorkflowSnapshot.version == request.target_version
+    ).first()
+    
+    if not snapshot:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Version {request.target_version} not found"
+        )
+    
+    state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
+    if not state:
+        raise HTTPException(status_code=404, detail="No workflow state found")
+    
+    # Just move the pointer — no version increment, no new snapshot
+    state.current_version = request.target_version
+    state.data = snapshot.data
+    state.updated_by = current_user.id
+    
+    last_msg = db.query(Message).filter(
         Message.chat_id == chat_id,
         Message.role == "assistant",
         Message.workflow_data.isnot(None)
     ).order_by(Message.created_at.desc()).first()
+    if last_msg:
+        last_msg.workflow_data = snapshot.data
+    
+    db.commit()
+    
+    await manager.broadcast_to_chat(chat_id, {
+        "type": "version_revert",
+        "chat_id": chat_id,
+        "current_version": state.current_version,
+        "max_version": state.version,
+        "target_version": request.target_version,
+        "data": snapshot.data,
+        "reverted_by": current_user.id,
+        "reverted_by_username": current_user.username,
+    }, exclude_user=current_user.id)
+    
+    return RevertResponse(
+        version=state.current_version,
+        data=snapshot.data,
+        message=f"Moved to version {request.target_version}"
+    )
+
+
+@app.get("/chats/{chat_id}/workflow/versions/{version}")
+def get_version_snapshot(
+    chat_id: int,
+    version: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Preview a specific version without reverting."""
+    get_chat_with_access(chat_id, current_user, db)
+    
+    snapshot = db.query(WorkflowSnapshot).filter(
+        WorkflowSnapshot.chat_id == chat_id,
+        WorkflowSnapshot.version == version
+    ).first()
+    
+    if not snapshot:
+        raise HTTPException(status_code=404, detail=f"Version {version} not found")
+    
+    creator = db.query(User).filter(User.id == snapshot.created_by).first() if snapshot.created_by else None
     
     return {
-        "message": "Undone successfully",
-        "workflow_data": prev_workflow.workflow_data if prev_workflow else None
+        "version": snapshot.version,
+        "data": snapshot.data,
+        "description": snapshot.description,
+        "created_by_username": creator.username if creator else None,
+        "created_at": snapshot.created_at.isoformat()
     }
+
+
+# ============================================================
+# Collaboration Endpoints
+# ============================================================
+
+@app.get("/users/search", response_model=List[UserSearchResponse])
+def search_users(
+    q: str = Query(..., min_length=1),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Search for users by username or email to share chats with."""
+    users = db.query(User).filter(
+        User.id != current_user.id,
+        or_(
+            User.username.ilike(f"%{q}%"),
+            User.email.ilike(f"%{q}%")
+        )
+    ).limit(10).all()
+    return users
+
+@app.post("/chats/{chat_id}/collaborators", response_model=CollaboratorResponse)
+async def add_collaborator(
+    chat_id: int,
+    collab: CollaboratorAdd,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Add a collaborator to a chat. Only the chat owner can do this."""
+    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found or you are not the owner")
+    
+    target_user = db.query(User).filter(User.username == collab.username).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail=f"User '{collab.username}' not found")
+    
+    if target_user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot add yourself as a collaborator")
+    
+    existing = db.query(ChatCollaborator).filter(
+        ChatCollaborator.chat_id == chat_id,
+        ChatCollaborator.user_id == target_user.id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User is already a collaborator")
+    
+    new_collab = ChatCollaborator(
+        chat_id=chat_id,
+        user_id=target_user.id,
+        role=collab.role,
+        invited_by=current_user.id
+    )
+    db.add(new_collab)
+    db.commit()
+    db.refresh(new_collab)
+    
+    await manager.broadcast_to_chat(chat_id, {
+        "type": "collaborator_added",
+        "chat_id": chat_id,
+        "user_id": target_user.id,
+        "username": target_user.username,
+        "role": collab.role
+    })
+    
+    return CollaboratorResponse(
+        id=new_collab.id,
+        user_id=target_user.id,
+        username=target_user.username,
+        email=target_user.email,
+        role=new_collab.role,
+        invited_by=current_user.id,
+        inviter_username=current_user.username,
+        created_at=new_collab.created_at
+    )
+
+@app.get("/chats/{chat_id}/collaborators", response_model=List[CollaboratorResponse])
+def get_collaborators(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all collaborators for a chat. Accessible by owner and collaborators."""
+    chat = get_chat_with_access(chat_id, current_user, db)
+    
+    collabs = db.query(ChatCollaborator).filter(ChatCollaborator.chat_id == chat_id).all()
+    result = []
+    for c in collabs:
+        user = db.query(User).filter(User.id == c.user_id).first()
+        inviter = db.query(User).filter(User.id == c.invited_by).first()
+        if user:
+            result.append(CollaboratorResponse(
+                id=c.id,
+                user_id=c.user_id,
+                username=user.username,
+                email=user.email,
+                role=c.role,
+                invited_by=c.invited_by,
+                inviter_username=inviter.username if inviter else "Unknown",
+                created_at=c.created_at
+            ))
+    return result
+
+@app.delete("/chats/{chat_id}/collaborators/{user_id}")
+async def remove_collaborator(
+    chat_id: int,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Remove a collaborator. Owner can remove anyone; collaborators can remove themselves."""
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    is_owner = chat.user_id == current_user.id
+    is_self = user_id == current_user.id
+    
+    if not is_owner and not is_self:
+        raise HTTPException(status_code=403, detail="Only the owner can remove other collaborators")
+    
+    collab = db.query(ChatCollaborator).filter(
+        ChatCollaborator.chat_id == chat_id,
+        ChatCollaborator.user_id == user_id
+    ).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Collaborator not found")
+    
+    removed_user = db.query(User).filter(User.id == user_id).first()
+    db.delete(collab)
+    db.commit()
+    
+    await manager.broadcast_to_chat(chat_id, {
+        "type": "collaborator_removed",
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "username": removed_user.username if removed_user else "Unknown"
+    })
+    
+    return {"message": "Collaborator removed successfully"}
+
+@app.patch("/chats/{chat_id}/collaborators/{user_id}")
+def update_collaborator_role(
+    chat_id: int,
+    user_id: int,
+    role_update: CollaboratorAdd,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update a collaborator's role. Only the chat owner can do this."""
+    chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == current_user.id).first()
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found or you are not the owner")
+    
+    collab = db.query(ChatCollaborator).filter(
+        ChatCollaborator.chat_id == chat_id,
+        ChatCollaborator.user_id == user_id
+    ).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Collaborator not found")
+    
+    collab.role = role_update.role
+    db.commit()
+    
+    return {"message": f"Role updated to {role_update.role}"}
+
+@app.get("/chats/{chat_id}/online")
+def get_online_users(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get currently online users in a chat."""
+    get_chat_with_access(chat_id, current_user, db)
+    return {"users": manager.get_online_users(chat_id)}
+
+
+# ============================================================
+# WebSocket Endpoint
+# ============================================================
+
+@app.websocket("/ws/{chat_id}")
+async def websocket_endpoint(websocket: WebSocket, chat_id: int, token: str = Query(...)):
+    """
+    WebSocket connection for real-time chat updates.
+    Authenticate via token query parameter.
+    """
+    from jose import JWTError, jwt as jose_jwt
+    
+    db = SessionLocal()
+    try:
+        payload = jose_jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+        
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            await websocket.close(code=4001, reason="User not found")
+            return
+        
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        if not chat:
+            await websocket.close(code=4004, reason="Chat not found")
+            return
+        
+        is_owner = chat.user_id == user.id
+        is_collab = db.query(ChatCollaborator).filter(
+            ChatCollaborator.chat_id == chat_id,
+            ChatCollaborator.user_id == user.id
+        ).first()
+        
+        if not is_owner and not is_collab:
+            await websocket.close(code=4003, reason="Access denied")
+            return
+        
+    except JWTError:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+    finally:
+        db.close()
+    
+    await manager.connect(websocket, chat_id, user.id, user.username)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data.get("type") == "typing":
+                await manager.broadcast_to_chat(chat_id, {
+                    "type": "typing",
+                    "chat_id": chat_id,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "is_typing": data.get("is_typing", False)
+                }, exclude_user=user.id)
+    except WebSocketDisconnect:
+        manager.disconnect(chat_id, user.id)
+        await manager.broadcast_presence(chat_id)
+    except Exception:
+        manager.disconnect(chat_id, user.id)
+        await manager.broadcast_presence(chat_id)
+
 
 @app.get("/")
 def root():

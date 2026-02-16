@@ -28,6 +28,34 @@
   color: #666;
 }
 
+.chatHeader {
+  padding: 8px 16px;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #FBF7F1;
+  min-height: 48px;
+}
+
+.shareButton {
+  padding: 6px 16px;
+  background: white;
+  color: #FC005C;
+  border: 1.5px solid #FC005C;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.shareButton:hover {
+  background: #FC005C;
+  color: white;
+}
+
 .messages {
   flex: 1;
   overflow-y: auto;
@@ -193,4 +221,37 @@
 .undoButton:disabled {
   opacity: 0.3;
   cursor: not-allowed;
+}
+
+.processingBanner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  margin: 4px 0;
+  background: #fff8e1;
+  border: 1px solid #ffe082;
+  border-radius: 10px;
+  color: #795548;
+  font-size: 13px;
+  animation: fadeIn 0.3s ease;
+}
+
+.processingDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff9800;
+  animation: pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
 }

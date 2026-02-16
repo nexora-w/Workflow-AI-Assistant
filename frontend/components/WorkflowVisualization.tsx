@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo, useEffect, useRef } from 'react';
+import { useCallback, useMemo, useEffect, useRef, useState } from 'react';
 import ReactFlow, {
   Node,
   Edge,
@@ -14,6 +14,8 @@ import ReactFlow, {
   MarkerType,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
+import { workflowApi, chatWS, WSMessage, WorkflowOp } from '@/lib/api';
+import VersionTimeline from './VersionTimeline';
 import styles from './WorkflowVisualization.module.css';
 
 interface WorkflowVisualizationProps {
@@ -29,6 +31,47 @@ export default function WorkflowVisualization({
 }: WorkflowVisualizationProps) {
   const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedDataRef = useRef<string | null>(null);
+  const workflowVersionRef = useRef<number>(0);
+  const [conflictMessage, setConflictMessage] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<string | null>(null);
+
+  const handleVersionRevert = useCallback((data: string, version: number) => {
+    workflowVersionRef.current = version;
+    setPreviewData(null);
+    if (onPositionChange) {
+      onPositionChange(data);
+    }
+  }, [onPositionChange]);
+
+  const handleVersionPreview = useCallback((data: string | null) => {
+    setPreviewData(data);
+  }, []);
+
+  // Fetch initial workflow version when chat or workflow changes
+  useEffect(() => {
+    if (chatId && workflowData) {
+      workflowApi.getState(chatId).then(state => {
+        workflowVersionRef.current = state.version;
+      }).catch(() => {
+        workflowVersionRef.current = 0;
+      });
+    }
+  }, [chatId, workflowData]);
+
+  // Listen for remote workflow operations to update our version
+  useEffect(() => {
+    const unsubOp = chatWS.on('workflow_op', (data: WSMessage) => {
+      if (data.chat_id === chatId && data.version) {
+        workflowVersionRef.current = data.version;
+      }
+    });
+    const unsubMsg = chatWS.on('new_message', (data: WSMessage) => {
+      if (data.chat_id === chatId && data.workflow_version) {
+        workflowVersionRef.current = data.workflow_version;
+      }
+    });
+    return () => { unsubOp(); unsubMsg(); };
+  }, [chatId]);
   const parseWorkflow = useCallback((data: string | null) => {
   if (!data) {
     return { nodes: [], edges: [] };
@@ -219,12 +262,14 @@ export default function WorkflowVisualization({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Update nodes and edges when workflow data changes
+  // Update nodes and edges when workflow data or preview changes
+  const displayData = previewData || workflowData;
+  
   useEffect(() => {
-    const { nodes: newNodes, edges: newEdges } = parseWorkflow(workflowData);
+    const { nodes: newNodes, edges: newEdges } = parseWorkflow(displayData);
     setNodes(newNodes);
     setEdges(newEdges);
-  }, [workflowData, parseWorkflow, setNodes, setEdges]);
+  }, [displayData, parseWorkflow, setNodes, setEdges]);
 
   // Cleanup debounce timer when unmounted
   useEffect(() => {
@@ -235,41 +280,92 @@ export default function WorkflowVisualization({
     };
   }, []);
 
-  // Debounced save function (implemented after discussion)
-  const debouncedSave = useCallback((updatedWorkflow: string) => {
-    // Clear existing timer
+  // Collect pending move operations and send them as a batch
+  const pendingOpsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+
+  const flushOperations = useCallback(async () => {
+    if (!chatId || pendingOpsRef.current.size === 0) return;
+
+    const ops: WorkflowOp[] = [];
+    pendingOpsRef.current.forEach((position, nodeId) => {
+      ops.push({
+        op_type: 'move_node',
+        payload: { node_id: nodeId, position }
+      });
+    });
+    pendingOpsRef.current.clear();
+
+    const baseVersion = workflowVersionRef.current;
+
+    try {
+      const result = await workflowApi.applyOperations(chatId, baseVersion, ops);
+
+      if (result.status === 'conflict') {
+        setConflictMessage(
+          result.conflicts[0] || 'Your edit conflicted with another user\'s change. Refreshing...'
+        );
+        setTimeout(() => setConflictMessage(null), 4000);
+
+        // Rebase: apply the server's latest state
+        if (onPositionChange) {
+          onPositionChange(result.data);
+        }
+        workflowVersionRef.current = result.version;
+      } else {
+        workflowVersionRef.current = result.version;
+        if (result.status === 'merged') {
+          // Server merged our changes with concurrent ones — update local state
+          if (onPositionChange) {
+            onPositionChange(result.data);
+          }
+        } else {
+          // Applied cleanly — also update the legacy message store
+          if (onPositionChange) {
+            onPositionChange(result.data);
+          }
+        }
+        lastSavedDataRef.current = result.data;
+      }
+    } catch (error) {
+      console.error('Failed to apply workflow operations:', error);
+      // Fallback to legacy full-state save
+      if (onPositionChange && workflowData) {
+        onPositionChange(workflowData);
+      }
+    }
+  }, [chatId, onPositionChange, workflowData]);
+
+  // Debounced flush
+  const debouncedFlush = useCallback(() => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
-
-    // Set new timer, waiting 500 ms after last change
     saveTimerRef.current = setTimeout(() => {
-      // Only save if data actually changed
-      if (updatedWorkflow !== lastSavedDataRef.current && onPositionChange) {
-        console.log('Saving workflow positions...');
-        onPositionChange(updatedWorkflow);
-        lastSavedDataRef.current = updatedWorkflow;
-      }
-    }, 500); // Value in milliseconds for debounce delay
-  }, [onPositionChange]);
+      flushOperations();
+    }, 500);
+  }, [flushOperations]);
 
-  // Handle node changes with debounced save
+  // Handle node changes with operation-based saving
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
     onNodesChange(changes);
     
-    // Check if any node was dragged
     const hasDragStop = changes.some(change => 
       change.type === 'position' && change.dragging === false
     );
     
     if (hasDragStop && workflowData) {
-      // Get current node positions after the change
       setTimeout(() => {
         setNodes((currentNodes) => {
           try {
             const workflow = JSON.parse(workflowData);
             
-            // Update positions in workflow data
+            for (const change of changes) {
+              if (change.type === 'position' && change.dragging === false && change.position) {
+                pendingOpsRef.current.set(change.id, change.position);
+              }
+            }
+            
+            // Also build the full updated workflow for local state
             const updatedNodes = workflow.nodes.map((node: any) => {
               const reactFlowNode = currentNodes.find((n: Node) => n.id === node.id);
               return {
@@ -278,22 +374,19 @@ export default function WorkflowVisualization({
               };
             });
             
-            const updatedWorkflow = {
-              ...workflow,
-              nodes: updatedNodes
-            };
+            const updatedWorkflow = { ...workflow, nodes: updatedNodes };
+            lastSavedDataRef.current = JSON.stringify(updatedWorkflow);
             
-            // Use debounced save instead of immediate save
-            debouncedSave(JSON.stringify(updatedWorkflow));
+            debouncedFlush();
           } catch (error) {
-            console.error('Failed to save positions:', error);
+            console.error('Failed to process position change:', error);
           }
           
           return currentNodes;
         });
       }, 0);
     }
-  }, [onNodesChange, workflowData, setNodes, debouncedSave]);
+  }, [onNodesChange, workflowData, setNodes, debouncedFlush]);
 
   if (!workflowData) {
     return (
@@ -321,6 +414,22 @@ export default function WorkflowVisualization({
 
   return (
     <div className={styles.container}>
+      {conflictMessage && (
+        <div className={styles.conflictBanner}>
+          <span className={styles.conflictIcon}>!</span>
+          {conflictMessage}
+        </div>
+      )}
+      {previewData && (
+        <div className={styles.previewBanner}>
+          Previewing an older version. Click &ldquo;Accept&rdquo; to revert or &ldquo;Exit preview&rdquo; to return.
+        </div>
+      )}
+      <VersionTimeline
+        chatId={chatId}
+        onRevert={handleVersionRevert}
+        onPreview={handleVersionPreview}
+      />
       <div className={styles.flowContainer}>
         <ReactFlow
           nodes={nodes}

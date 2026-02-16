@@ -1,0 +1,70 @@
+.container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+.avatarStack {
+  display: flex;
+  flex-direction: row-reverse;
+}
+
+.avatarBubble {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: #FC005C;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  border: 2px solid white;
+  margin-left: -8px;
+  position: relative;
+  cursor: default;
+}
+
+.avatarBubble:last-child {
+  margin-left: 0;
+}
+
+.onlineDot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 10px;
+  height: 10px;
+  background: #22c55e;
+  border: 2px solid white;
+  border-radius: 50%;
+}
+
+.overflowBubble {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: #e0e0e0;
+  color: #666;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  border: 2px solid white;
+  margin-left: -8px;
+}
+
+.typingIndicator {
+  font-size: 12px;
+  color: #999;
+  font-style: italic;
+  animation: fadeInOut 1.5s ease-in-out infinite;
+}
+
+@keyframes fadeInOut {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
