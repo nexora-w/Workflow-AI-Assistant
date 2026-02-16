@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/lib/store';
 import AuthForm from '@/components/AuthForm';
 import ChatList from '@/components/ChatList';
@@ -9,28 +10,15 @@ import WorkflowVisualization from '@/components/WorkflowVisualization';
 import '../styles/globals.css';
 import styles from './page.module.css';
 import { chatApi } from '@/lib/api';
-import type { StreamingNode, StreamingEdge } from '@/types';
+import type { StreamingData, StreamEvent } from '@/types';
 
-export interface StreamingData {
-  nodes: StreamingNode[];
-  edges: StreamingEdge[];
-  isStreaming: boolean;
-}
-
-export type StreamEvent =
-  | { type: 'start' }
-  | { type: 'node_add'; node: StreamingNode }
-  | { type: 'edge_add'; edge: StreamingEdge }
-  | { type: 'workflow_complete'; workflow_data: string | null; display_content: string }
-  | { type: 'end'; message_id: number; workflow_version: number | null }
-  | { type: 'error'; error: string };
+export type { StreamingData, StreamEvent } from '@/types';
 
 export default function Home() {
+  const router = useRouter();
   const { user, isLoading, logout, checkAuth } = useAuthStore();
-  const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
   const [workflowData, setWorkflowData] = useState<string | null>(null);
   const [currentMessageId, setCurrentMessageId] = useState<number | null>(null);
-  const [isOwnerOfSelected, setIsOwnerOfSelected] = useState(true);
   const [streamingData, setStreamingData] = useState<StreamingData | null>(null);
 
   const handleWorkflowUpdate = useCallback((data: string | null, messageId?: number) => {
@@ -84,16 +72,18 @@ export default function Home() {
   };
 
   const handleSelectChat = useCallback((chatId: number | null) => {
-    setSelectedChatId(chatId);
-    setIsOwnerOfSelected(true);
     setStreamingData(null);
-  }, []);
+    if (chatId === null) {
+      router.push('/');
+    } else {
+      router.push(`/chat/${chatId}`);
+    }
+  }, [router]);
 
-  const handleSelectSharedChat = useCallback((chatId: number, ownerUsername: string) => {
-    setSelectedChatId(chatId);
-    setIsOwnerOfSelected(false);
+  const handleSelectSharedChat = useCallback((chatId: number) => {
     setStreamingData(null);
-  }, []);
+    router.push(`/chat/${chatId}`);
+  }, [router]);
 
   useEffect(() => {
     checkAuth();
@@ -119,7 +109,6 @@ export default function Home() {
         <div className={styles.userInfo}>
           <span>Welcome, {user.username}</span>
           <button onClick={() => {
-            setSelectedChatId(null);
             setWorkflowData(null);
             logout();
           }} className={styles.logoutButton}>
@@ -132,25 +121,25 @@ export default function Home() {
         <div className={styles.chatListSection}>
           <ChatList
             onSelectChat={handleSelectChat}
-            selectedChatId={selectedChatId}
+            selectedChatId={null}
             onSelectSharedChat={handleSelectSharedChat}
           />
         </div>
 
         <div className={styles.chatWindowSection}>
           <ChatWindow
-            chatId={selectedChatId}
+            chatId={null}
             onWorkflowUpdate={handleWorkflowUpdate}
             onStreamEvent={handleStreamEvent}
-            isOwner={isOwnerOfSelected}
+            isOwner={true}
           />
         </div>
 
         <div className={styles.workflowSection}>
-          <WorkflowVisualization 
-            workflowData={workflowData} 
+          <WorkflowVisualization
+            workflowData={workflowData}
             streamingData={streamingData}
-            chatId={selectedChatId}
+            chatId={null}
             onPositionChange={handlePositionChange}
           />
         </div>

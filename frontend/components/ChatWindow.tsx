@@ -5,7 +5,7 @@ import { chatApi, Message, chatWS, OnlineUser, WSMessage, streamApi } from '@/li
 import ShareDialog from './ShareDialog';
 import OnlineIndicator from './OnlineIndicator';
 import styles from './ChatWindow.module.css';
-import type { StreamEvent } from '@/app/page';
+import type { StreamEvent } from '@/types';
 
 /** Delay between revealing each character (ms) for ChatGPT-like typing. */
 const CHAR_REVEAL_INTERVAL_MS = 20;

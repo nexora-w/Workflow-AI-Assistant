@@ -127,3 +127,17 @@ export interface StreamCallbacks {
   onStreamEnd?: (data: { message_id: number; workflow_version: number | null }) => void;
   onError?: (error: string) => void;
 }
+
+export interface StreamingData {
+  nodes: StreamingNode[];
+  edges: StreamingEdge[];
+  isStreaming: boolean;
+}
+
+export type StreamEvent =
+  | { type: 'start' }
+  | { type: 'node_add'; node: StreamingNode }
+  | { type: 'edge_add'; edge: StreamingEdge }
+  | { type: 'workflow_complete'; workflow_data: string | null; display_content: string }
+  | { type: 'end'; message_id: number; workflow_version: number | null }
+  | { type: 'error'; error: string };
