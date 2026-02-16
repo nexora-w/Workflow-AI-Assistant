@@ -22,13 +22,13 @@ export default function Home() {
   };
 
   const handlePositionChange = async (updatedWorkflow: string) => {
-  if (currentMessageId) {
+    if (currentMessageId) {
       try {
         await chatApi.updateWorkflowPositions(currentMessageId, updatedWorkflow);
       } catch (error) {
         console.error('Failed to save positions:', error);
       }
-  }
+    }
   };
 
 

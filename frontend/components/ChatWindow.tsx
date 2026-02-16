@@ -166,7 +166,7 @@ export default function ChatWindow({ chatId, onWorkflowUpdate }: ChatWindowProps
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyPress={handleKeyPress}
+          onKeyDown={handleKeyPress}
           placeholder="Describe the workflow you need..."
           className={styles.input}
           rows={3}

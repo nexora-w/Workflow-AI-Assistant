@@ -1,4 +1,3 @@
-from urllib import response
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -150,7 +149,7 @@ async def create_message(
         message_count = db.query(Message).filter(Message.chat_id == chat_id).count()
         if message_count == 1:  # First message
             # Generate a short title from the user's message
-            title = message.content[:50]  # Take first 50 chars of meesage
+            title = message.content[:50]  # Take first 50 chars of message
             if len(message.content) > 50:
                 title = title.rsplit(' ', 1)[0] + "..."  # Cut at last word
             chat.title = title
@@ -258,7 +257,7 @@ async def create_message(
         }
         
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-4o-mini",
             messages=[system_message] + conversation,
             max_completion_tokens=5000
         )
@@ -305,7 +304,7 @@ async def create_message(
                     data = json.loads(code_block_match.group(1))
                     if 'nodes' in data and 'edges' in data:
                         return code_block_match.group(1), code_block_match.group(0)
-                except:
+                except (json.JSONDecodeError, ValueError):
                     pass
             
             # Method 2: Look for JSON object anywhere with proper nesting
@@ -324,7 +323,7 @@ async def create_message(
                         if isinstance(data['nodes'], list) and isinstance(data['edges'], list):
                             if len(data['nodes']) > 0:  # Ensure at least one node
                                 return match.group(0), match.group(0)
-                except:
+                except (json.JSONDecodeError, ValueError):
                     continue
             
             return None, None
@@ -391,7 +390,7 @@ async def create_message(
         
         return ai_message
     except Exception as e:
-        # If OpenAI fails, and error log is printed, and  then a fallback response is returned
+        # If OpenAI fails, an error log is printed, then a fallback response is returned
         print(f"OpenAI Error: {type(e).__name__}: {str(e)}")
         
         fallback_workflow = json.dumps({

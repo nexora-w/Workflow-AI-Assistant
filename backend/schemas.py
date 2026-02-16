@@ -7,7 +7,7 @@ class UserCreate(BaseModel):
     username: str
     email: EmailStr
     password: str
-# Schwema for user login
+# Schema for user login
 class UserLogin(BaseModel):
     username: str
     password: str

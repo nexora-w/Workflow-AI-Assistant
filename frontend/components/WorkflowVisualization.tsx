@@ -250,7 +250,7 @@ export default function WorkflowVisualization({
         onPositionChange(updatedWorkflow);
         lastSavedDataRef.current = updatedWorkflow;
       }
-    }, 500); // Value in miliseconds for debounce delay
+    }, 500); // Value in milliseconds for debounce delay
   }, [onPositionChange]);
 
   // Handle node changes with debounced save
@@ -313,7 +313,7 @@ export default function WorkflowVisualization({
             <path d="M10 6.5h4M10 17.5h4M6.5 10v4M17.5 10v4" />
           </svg>
           <h3>Workflow Visualization</h3>
-          <p>Ask the AI Chabot to create a workflow and it will be visualized over here</p>
+          <p>Ask the AI Chatbot to create a workflow and it will be visualized over here</p>
         </div>
       </div>
     );
