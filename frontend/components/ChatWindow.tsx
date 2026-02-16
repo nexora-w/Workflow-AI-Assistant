@@ -59,7 +59,7 @@ export default function ChatWindow({ chatId, onWorkflowUpdate, onStreamEvent, is
 
   useEffect(() => {
     const unsubPresence = chatWS.on('presence', (data: WSMessage) => {
-      setOnlineUsers(data.users || []);
+      setOnlineUsers((data.users as OnlineUser[]) || []);
     });
 
     const unsubNewMessage = chatWS.on('new_message', (data: WSMessage) => {
@@ -70,37 +70,38 @@ export default function ChatWindow({ chatId, onWorkflowUpdate, onStreamEvent, is
 
     const unsubWorkflow = chatWS.on('workflow_update', (data: WSMessage) => {
       if (data.chat_id === chatId && data.workflow_data) {
-        onWorkflowUpdate(data.workflow_data, data.message_id);
+        onWorkflowUpdate(data.workflow_data as string, data.message_id as number);
       }
     });
 
     const unsubUndo = chatWS.on('undo', (data: WSMessage) => {
       if (data.chat_id === chatId) {
         loadMessages();
-        onWorkflowUpdate(data.workflow_data || null);
+        onWorkflowUpdate((data.workflow_data as string) || null);
       }
     });
 
     const unsubTyping = chatWS.on('typing', (data: WSMessage) => {
+      const username = data.username as string;
       if (data.is_typing) {
         setTypingUsers(prev => {
-          if (!prev.includes(data.username)) return [...prev, data.username];
+          if (!prev.includes(username)) return [...prev, username];
           return prev;
         });
         setTimeout(() => {
-          setTypingUsers(prev => prev.filter(u => u !== data.username));
+          setTypingUsers(prev => prev.filter(u => u !== username));
         }, 3000);
       } else {
-        setTypingUsers(prev => prev.filter(u => u !== data.username));
+        setTypingUsers(prev => prev.filter(u => u !== username));
       }
     });
 
     const unsubProcessing = chatWS.on('processing', (data: WSMessage) => {
       if (data.chat_id !== chatId) return;
       if (data.status === 'started') {
-        setProcessingInfo(`Processing ${data.processed_by_username}'s message...`);
+        setProcessingInfo(`Processing ${data.processed_by_username as string}'s message...`);
       } else if (data.status === 'queued') {
-        setProcessingInfo(data.message || 'Waiting for another request to finish...');
+        setProcessingInfo((data.message as string) || 'Waiting for another request to finish...');
       } else if (data.status === 'done') {
         setProcessingInfo(null);
       }

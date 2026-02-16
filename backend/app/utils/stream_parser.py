@@ -8,7 +8,7 @@ is finished.
 """
 
 import json
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Set, Tuple
 
 
 class IncrementalWorkflowParser:
@@ -94,10 +94,6 @@ class IncrementalWorkflowParser:
                     })
         return result
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _is_node(obj: Dict) -> bool:
         return (
@@ -113,14 +109,11 @@ class IncrementalWorkflowParser:
             isinstance(obj, dict)
             and "from" in obj
             and "to" in obj
-            and "id" not in obj  # avoid confusing a node with an edge
+            and "id" not in obj
         )
 
     def _extract_leaf_objects(self) -> List[Dict]:
-        """
-        Scan the buffer for complete JSON objects that have no nested
-        objects (leaf-level).  These are the node / edge candidates.
-        """
+        """Scan the buffer for complete JSON leaf objects (node/edge candidates)."""
         objects: List[Dict] = []
         text = self.buffer
         i = 0
@@ -137,19 +130,16 @@ class IncrementalWorkflowParser:
                     elif ch == "}":
                         depth -= 1
                     elif ch == '"':
-                        # Skip over string contents to avoid counting
-                        # braces inside string values.
                         j += 1
                         while j < length and text[j] != '"':
                             if text[j] == "\\":
-                                j += 1  # skip escaped char
+                                j += 1
                             j += 1
                     j += 1
 
                 if depth == 0:
                     candidate = text[i:j]
                     inner = candidate[1:-1]
-                    # Leaf object: no nested braces (after accounting for strings)
                     if self._has_no_nested_braces(inner):
                         try:
                             obj = json.loads(candidate)
@@ -159,7 +149,6 @@ class IncrementalWorkflowParser:
                             pass
                     i = j
                 else:
-                    # Incomplete object — stop scanning
                     break
             else:
                 i += 1
@@ -168,7 +157,6 @@ class IncrementalWorkflowParser:
 
     @staticmethod
     def _has_no_nested_braces(inner: str) -> bool:
-        """Check that `inner` (text between outer { }) has no nested { }."""
         in_string = False
         for i, ch in enumerate(inner):
             if ch == '"' and (i == 0 or inner[i - 1] != "\\"):

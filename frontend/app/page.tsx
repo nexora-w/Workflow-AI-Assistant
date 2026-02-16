@@ -8,7 +8,8 @@ import ChatWindow from '@/components/ChatWindow';
 import WorkflowVisualization from '@/components/WorkflowVisualization';
 import '../styles/globals.css';
 import styles from './page.module.css';
-import { chatApi, StreamingNode, StreamingEdge } from '@/lib/api';
+import { chatApi } from '@/lib/api';
+import type { StreamingNode, StreamingEdge } from '@/types';
 
 export interface StreamingData {
   nodes: StreamingNode[];

@@ -40,27 +40,42 @@ A web-based chatbot that helps companies design and visualize business process w
 - 30% - Chat window
 - 50% - Workflow visualization panel
 
+## Project Structure (Senior-Level Layout)
+
+### Backend (`backend/app/`)
+- **`app/main.py`** – FastAPI app, CORS, router registration, startup.
+- **`app/core/`** – Config (Pydantic Settings), database (engine, session, init), security (JWT, password hashing).
+- **`app/models/`** – SQLAlchemy models (User, Chat, Message, WorkflowState, etc.) in domain modules.
+- **`app/schemas/`** – Pydantic request/response schemas by domain (auth, chat, collaboration, workflow).
+- **`app/api/`** – Routers: auth, chats, workflow, collaboration, websocket (thin handlers, Depends).
+- **`app/services/`** – Business logic: AI (prompts, JSON extraction, sync AI response), workflow (state/snapshots), chat (access control).
+- **`app/websocket/`** – Connection manager and per-chat lock manager.
+- **`app/utils/`** – Stream parser (incremental workflow JSON), conflict resolver (version-based merge).
+
+Run from repo root: `uvicorn app.main:app --host 0.0.0.0 --port 8000` with `backend` as cwd (or Docker CMD).
+
+### Frontend (`frontend/`)
+- **`types/`** – Shared TypeScript types (User, Chat, Message, workflow, streaming, WS).
+- **`lib/api/`** – API client split by domain: `client.ts` (axios + auth header), `auth.ts`, `chat.ts`, `workflow.ts`, `collaboration.ts`, `stream.ts`, `websocket.ts`; `index.ts` re-exports all.
+- **`lib/store.ts`** – Zustand auth store.
+- **`components/`** – Feature components (AuthForm, ChatList, ChatWindow, WorkflowVisualization, etc.).
+- **`app/`** – Next.js App Router (page, layout, styles).
+
 ## Technical Implementation
 
 ### Backend (FastAPI)
-- **Files**: 4 Python modules (400 lines)
+- **Layout**: Package `app/` with core, models, schemas, api, services, websocket, utils.
 - **Features**:
-  - RESTful API with 10+ endpoints
-  - SQLAlchemy ORM with MySQL support
-  - JWT authentication middleware
-  - OpenAI API integration
-  - CORS configuration
-  - Error handling
+  - RESTful API with 10+ endpoints (auth, chats, messages, workflow, collaboration, WebSocket).
+  - SQLAlchemy ORM with MySQL/PostgreSQL support, Pydantic Settings for config.
+  - JWT authentication, per-chat message serialization (lock), real-time presence and broadcasts.
 
 ### Frontend (Next.js 14)
-- **Files**: 9 TypeScript/TSX components (683 lines)
+- **Layout**: Shared `types/`, domain-split `lib/api/`, single auth store.
 - **Features**:
-  - Modern React with App Router
-  - Type-safe API client
-  - State management with Zustand
-  - ReactFlow integration
-  - Responsive CSS modules (567 lines)
-  - Form validation
+  - Modern React with App Router, type-safe API client and WebSocket/SSE.
+  - State management with Zustand, ReactFlow for workflow visualization.
+  - Responsive CSS modules, form validation.
 
 ### Database (MySQL)
 - **Tables**: 3 (users, chats, messages)

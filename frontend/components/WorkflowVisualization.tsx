@@ -91,13 +91,13 @@ export default function WorkflowVisualization({
   // Listen for remote workflow operations to update our version
   useEffect(() => {
     const unsubOp = chatWS.on('workflow_op', (data: WSMessage) => {
-      if (data.chat_id === chatId && data.version) {
-        workflowVersionRef.current = data.version;
+      if (data.chat_id === chatId && data.version != null) {
+        workflowVersionRef.current = data.version as number;
       }
     });
     const unsubMsg = chatWS.on('new_message', (data: WSMessage) => {
-      if (data.chat_id === chatId && data.workflow_version) {
-        workflowVersionRef.current = data.workflow_version;
+      if (data.chat_id === chatId && data.workflow_version != null) {
+        workflowVersionRef.current = data.workflow_version as number;
       }
     });
     return () => { unsubOp(); unsubMsg(); };

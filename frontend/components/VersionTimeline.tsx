@@ -40,11 +40,14 @@ export default function VersionTimeline({ chatId, onRevert, onPreview }: Version
     const unsub2 = chatWS.on('new_message', () => loadTimeline());
     // Undo/redo only moves the pointer — no new snapshots, just update pointer
     const unsub3 = chatWS.on('version_revert', (data: WSMessage) => {
-      if (data.current_version) {
-        setCurrentVersion(data.current_version);
+      const currentVersion = data.current_version as number | undefined;
+      const version = data.version as number | undefined;
+      if (currentVersion != null) {
+        setCurrentVersion(currentVersion);
       }
-      if (data.data) {
-        onRevert(data.data, data.current_version ?? data.version);
+      const ver = currentVersion ?? version;
+      if (data.data && typeof ver === 'number') {
+        onRevert(data.data as string, ver);
       }
     });
     return () => { unsub1(); unsub2(); unsub3(); };
