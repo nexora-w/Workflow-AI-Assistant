@@ -1,5 +1,5 @@
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, UniqueConstraint, Enum
-from sqlalchemy.orm import sessionmaker, relationship, DeclarativeBase
+from sqlalchemy.orm import sessionmaker, relationship, backref, DeclarativeBase
 from datetime import datetime
 import enum
 import os
@@ -117,7 +117,7 @@ class WorkflowState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     
-    chat = relationship("Chat", backref="workflow_state_rel")
+    chat = relationship("Chat", backref=backref("workflow_state_rel", passive_deletes=True), passive_deletes=True)
     editor = relationship("User", foreign_keys=[updated_by])
 
 

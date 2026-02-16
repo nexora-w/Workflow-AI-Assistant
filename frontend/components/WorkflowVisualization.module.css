@@ -85,3 +85,52 @@
   from { transform: translateY(-100%); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 }
+
+/* ============================================================
+   Streaming / Building banner
+   ============================================================ */
+
+.streamingBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: linear-gradient(90deg, #fdf2f8, #fce7f3, #fdf2f8);
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite, slideDown 0.3s ease;
+  border-bottom: 2px solid #FC005C;
+  color: #9d174d;
+  font-size: 13px;
+  font-weight: 600;
+  z-index: 10;
+}
+
+.streamingDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #FC005C;
+  animation: streamPulse 1s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.streamingCount {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: #be185d;
+  font-size: 12px;
+  font-weight: 500;
+  background: rgba(252, 0, 92, 0.08);
+  padding: 2px 10px;
+  border-radius: 12px;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes streamPulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.3); }
+}

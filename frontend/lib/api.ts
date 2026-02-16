@@ -344,4 +344,133 @@ export class ChatWebSocket {
 
 export const chatWS = new ChatWebSocket();
 
+
+// ============================================================
+// Streaming types & SSE client for partial workflow updates
+// ============================================================
+
+export interface StreamingNode {
+  id: string;
+  label: string;
+  type: string;
+}
+
+export interface StreamingEdge {
+  from: string;
+  to: string;
+}
+
+export interface StreamCallbacks {
+  onStreamStart?: (data: { user_message_id: number }) => void;
+  onTextChunk?: (data: { content: string }) => void;
+  onNodeAdd?: (data: { node: StreamingNode }) => void;
+  onEdgeAdd?: (data: { edge: StreamingEdge }) => void;
+  onWorkflowComplete?: (data: { workflow_data: string | null; display_content: string }) => void;
+  onStreamEnd?: (data: { message_id: number; workflow_version: number | null }) => void;
+  onError?: (error: string) => void;
+}
+
+export const streamApi = {
+  /**
+   * Send a message and receive the AI response as Server-Sent Events.
+   * Returns an AbortController so the caller can cancel mid-stream.
+   */
+  streamMessage: (chatId: number, content: string, callbacks: StreamCallbacks): AbortController => {
+    const token = localStorage.getItem('token');
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const response = await fetch(`${API_URL}/chats/${chatId}/messages/stream`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ content }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          let detail = 'Stream request failed';
+          try {
+            const err = await response.json();
+            detail = err.detail || detail;
+          } catch { /* ignore parse errors */ }
+          callbacks.onError?.(detail);
+          return;
+        }
+
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE events are separated by double newlines
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop() || '';
+
+          for (const part of parts) {
+            if (!part.trim()) continue;
+
+            let eventType = '';
+            let eventData = '';
+
+            for (const line of part.split('\n')) {
+              if (line.startsWith('event: ')) {
+                eventType = line.slice(7);
+              } else if (line.startsWith('data: ')) {
+                eventData = line.slice(6);
+              }
+            }
+
+            if (!eventType || !eventData) continue;
+
+            try {
+              const data = JSON.parse(eventData);
+              switch (eventType) {
+                case 'stream_start':
+                  callbacks.onStreamStart?.(data);
+                  break;
+                case 'text_chunk':
+                  callbacks.onTextChunk?.(data);
+                  break;
+                case 'node_add':
+                  callbacks.onNodeAdd?.(data);
+                  break;
+                case 'edge_add':
+                  callbacks.onEdgeAdd?.(data);
+                  break;
+                case 'workflow_complete':
+                  callbacks.onWorkflowComplete?.(data);
+                  break;
+                case 'stream_end':
+                  callbacks.onStreamEnd?.(data);
+                  break;
+                case 'error':
+                  callbacks.onError?.(data.error || 'Unknown stream error');
+                  break;
+              }
+            } catch {
+              // Ignore malformed SSE data
+            }
+          }
+        }
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          callbacks.onError?.(err.message || 'Stream connection failed');
+        }
+      }
+    })();
+
+    return controller;
+  },
+};
+
+
 export default api;

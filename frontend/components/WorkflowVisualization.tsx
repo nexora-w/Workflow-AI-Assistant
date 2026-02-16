@@ -12,20 +12,45 @@ import ReactFlow, {
   BackgroundVariant,
   NodeChange,
   MarkerType,
+  ReactFlowInstance,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
-import { workflowApi, chatWS, WSMessage, WorkflowOp } from '@/lib/api';
+import { workflowApi, chatWS, WSMessage, WorkflowOp, StreamingNode, StreamingEdge } from '@/lib/api';
+import type { StreamingData } from '@/app/page';
 import VersionTimeline from './VersionTimeline';
 import styles from './WorkflowVisualization.module.css';
 
+/** Delay (ms) between each node "dropping in" during streaming. */
+const NODE_REVEAL_DELAY = 400;
+
 interface WorkflowVisualizationProps {
   workflowData: string | null;
+  streamingData?: StreamingData | null;
   chatId: number | null;
   onPositionChange?: (workflowData: string) => void;
 }
 
+// Node style helper
+function getNodeStyle(type: string): React.CSSProperties {
+  return {
+    background: type === 'start' ? '#FC005C' :
+               type === 'end' ? '#667eea' :
+               type === 'decision' ? '#f6ad55' :
+               '#48bb78',
+    color: 'white',
+    padding: '10px 20px',
+    borderRadius: type === 'decision' ? '8px' : '50px',
+    fontSize: '14px',
+    fontWeight: '500',
+    border: 'none',
+    minWidth: '150px',
+    textAlign: 'center' as const,
+  };
+}
+
 export default function WorkflowVisualization({ 
-  workflowData, 
+  workflowData,
+  streamingData,
   chatId,
   onPositionChange 
 }: WorkflowVisualizationProps) {
@@ -34,6 +59,11 @@ export default function WorkflowVisualization({
   const workflowVersionRef = useRef<number>(0);
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<string | null>(null);
+
+  // ----- Staggered node reveal state -----
+  const [revealedCount, setRevealedCount] = useState(0);
+  const revealTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const reactFlowRef = useRef<ReactFlowInstance | null>(null);
 
   const handleVersionRevert = useCallback((data: string, version: number) => {
     workflowVersionRef.current = version;
@@ -72,6 +102,47 @@ export default function WorkflowVisualization({
     });
     return () => { unsubOp(); unsubMsg(); };
   }, [chatId]);
+
+  // ----- Staggered node reveal: reveal one node at a time like chat messages -----
+
+  // Reset when streaming stops
+  useEffect(() => {
+    if (!streamingData) {
+      setRevealedCount(0);
+      if (revealTimerRef.current) {
+        clearTimeout(revealTimerRef.current);
+        revealTimerRef.current = null;
+      }
+    }
+  }, [streamingData]);
+
+  // Drive the stagger: whenever there are un-revealed nodes, schedule the next one
+  useEffect(() => {
+    if (!streamingData) return;
+
+    const target = streamingData.nodes.length;
+
+    if (revealedCount < target) {
+      revealTimerRef.current = setTimeout(() => {
+        setRevealedCount(prev => prev + 1);
+      }, NODE_REVEAL_DELAY);
+    }
+
+    return () => {
+      if (revealTimerRef.current) {
+        clearTimeout(revealTimerRef.current);
+        revealTimerRef.current = null;
+      }
+    };
+  }, [streamingData, streamingData?.nodes.length, revealedCount]);
+
+  // Auto-fit the view each time a new node is revealed (camera follows the graph)
+  useEffect(() => {
+    if (revealedCount > 0 && reactFlowRef.current) {
+      reactFlowRef.current.fitView({ padding: 0.35, duration: 300 });
+    }
+  }, [revealedCount]);
+
   const parseWorkflow = useCallback((data: string | null) => {
   if (!data) {
     return { nodes: [], edges: [] };
@@ -209,20 +280,7 @@ export default function WorkflowVisualization({
         type: 'default',
         data: { label: node.label },
         position,
-        style: {
-          background: node.type === 'start' ? '#FC005C' :
-                     node.type === 'end' ? '#667eea' :
-                     node.type === 'decision' ? '#f6ad55' :
-                     '#48bb78',
-          color: 'white',
-          padding: '10px 20px',
-          borderRadius: node.type === 'decision' ? '8px' : '50px',
-          fontSize: '14px',
-          fontWeight: '500',
-          border: 'none',
-          minWidth: '150px',
-          textAlign: 'center',
-        },
+        style: getNodeStyle(node.type),
       };
     });
 
@@ -254,6 +312,62 @@ export default function WorkflowVisualization({
   }
 }, []);
 
+  // Build streaming visualization: only show the first `revealedCount` nodes.
+  // Each node gets an entrance animation; the newest gets a glow.
+  const buildStreamingGraph = useCallback(
+    (sData: StreamingData, revealed: number): { nodes: Node[]; edges: Edge[] } => {
+      const centerX = 400;
+      const verticalSpacing = 180;
+
+      // Only show nodes up to the revealed count
+      const visibleNodes = sData.nodes.slice(0, revealed);
+      const visibleIds = new Set(visibleNodes.map(n => n.id));
+
+      const nodes: Node[] = visibleNodes.map((node, index) => ({
+        id: node.id,
+        type: 'default',
+        data: { label: node.label },
+        position: { x: centerX, y: 100 + index * verticalSpacing },
+        style: {
+          ...getNodeStyle(node.type),
+          animation: 'workflowNodeAppear 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards',
+          // The newest revealed node gets a pulsing glow
+          ...(index === revealed - 1 && sData.isStreaming
+            ? {
+                boxShadow:
+                  '0 0 0 4px rgba(252, 0, 92, 0.3), 0 0 20px rgba(252, 0, 92, 0.15)',
+              }
+            : {}),
+        },
+      }));
+
+      // Only show edges where BOTH source and target are already revealed
+      const edges: Edge[] = sData.edges
+        .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
+        .map(edge => ({
+          id: `e${edge.from}-${edge.to}`,
+          source: edge.from,
+          target: edge.to,
+          animated: true,
+          style: {
+            stroke: '#667eea',
+            strokeWidth: 2,
+            animation: 'workflowEdgeAppear 0.4s ease-out forwards',
+          },
+          type: 'smoothstep',
+          markerEnd: {
+            type: MarkerType.ArrowClosed,
+            width: 20,
+            height: 20,
+            color: '#667eea',
+          },
+        }));
+
+      return { nodes, edges };
+    },
+    []
+  );
+
   const { nodes: initialNodes, edges: initialEdges } = useMemo(
     () => parseWorkflow(workflowData),
     [workflowData, parseWorkflow]
@@ -262,14 +376,28 @@ export default function WorkflowVisualization({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Update nodes and edges when workflow data or preview changes
+  // Update nodes and edges when workflow data, preview, or streaming changes
   const displayData = previewData || workflowData;
-  
+
   useEffect(() => {
-    const { nodes: newNodes, edges: newEdges } = parseWorkflow(displayData);
-    setNodes(newNodes);
-    setEdges(newEdges);
-  }, [displayData, parseWorkflow, setNodes, setEdges]);
+    // If actively streaming AND we have nodes to show, use the staggered reveal
+    if (streamingData && revealedCount > 0) {
+      const { nodes: sNodes, edges: sEdges } = buildStreamingGraph(
+        streamingData,
+        revealedCount
+      );
+      setNodes(sNodes);
+      setEdges(sEdges);
+      return;
+    }
+
+    // Otherwise render the final (non-streaming) workflow
+    if (!streamingData) {
+      const { nodes: newNodes, edges: newEdges } = parseWorkflow(displayData);
+      setNodes(newNodes);
+      setEdges(newEdges);
+    }
+  }, [displayData, streamingData, revealedCount, parseWorkflow, buildStreamingGraph, setNodes, setEdges]);
 
   // Cleanup debounce timer when unmounted
   useEffect(() => {
@@ -388,7 +516,10 @@ export default function WorkflowVisualization({
     }
   }, [onNodesChange, workflowData, setNodes, debouncedFlush]);
 
-  if (!workflowData) {
+  const isStreamActive = streamingData && streamingData.isStreaming;
+  const hasVisibleStreamingNodes = streamingData && revealedCount > 0;
+
+  if (!workflowData && !hasVisibleStreamingNodes) {
     return (
       <div className={styles.container}>
         <div className={styles.emptyState}>
@@ -414,6 +545,15 @@ export default function WorkflowVisualization({
 
   return (
     <div className={styles.container}>
+      {isStreamActive && (
+        <div className={styles.streamingBanner}>
+          <div className={styles.streamingDot} />
+          <span>Building workflow&hellip;</span>
+          <span className={styles.streamingCount}>
+            {revealedCount} / {streamingData!.nodes.length} node{streamingData!.nodes.length !== 1 ? 's' : ''}
+          </span>
+        </div>
+      )}
       {conflictMessage && (
         <div className={styles.conflictBanner}>
           <span className={styles.conflictIcon}>!</span>
@@ -436,6 +576,7 @@ export default function WorkflowVisualization({
           edges={edges}
           onNodesChange={handleNodesChange}
           onEdgesChange={onEdgesChange}
+          onInit={(instance) => { reactFlowRef.current = instance; }}
           fitView
           attributionPosition="bottom-left"
           defaultEdgeOptions={{

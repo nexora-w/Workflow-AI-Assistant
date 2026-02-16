@@ -29,3 +29,39 @@ button {
   cursor: pointer;
   font-family: inherit;
 }
+
+/* ============================================================
+   Global keyframes for streaming workflow animations.
+   These must be global because React Flow applies node/edge
+   styles as inline CSS — CSS module names are not reachable.
+   ============================================================ */
+
+@keyframes workflowNodeAppear {
+  0% {
+    opacity: 0;
+    filter: blur(6px);
+    transform: translateY(-18px) scale(0.88);
+  }
+  50% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(3px) scale(1.03);
+  }
+  75% {
+    transform: translateY(-1px) scale(0.99);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes workflowEdgeAppear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

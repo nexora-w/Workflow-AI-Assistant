@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from datetime import timedelta, datetime
@@ -9,6 +10,8 @@ import os
 import re
 import asyncio
 from dotenv import load_dotenv
+
+from stream_parser import IncrementalWorkflowParser
 
 from database import (
     get_db, init_db, User, Chat, Message, ChatCollaborator,
@@ -175,6 +178,137 @@ class ChatLockManager:
 
 
 chat_lock_manager = ChatLockManager()
+
+
+# ============================================================
+# Workflow JSON extraction helper (used by both sync and streaming paths)
+# ============================================================
+
+def extract_json_workflow(text: str):
+    """
+    Try multiple methods to extract a workflow JSON object from AI response text.
+    Returns (json_string, full_match_string) or (None, None).
+    """
+    # Method 1: Look for JSON in code blocks (```json {...} ```)
+    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if code_block_match:
+        try:
+            data = json.loads(code_block_match.group(1))
+            if 'nodes' in data and 'edges' in data:
+                return code_block_match.group(1), code_block_match.group(0)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Method 2: Look for JSON object anywhere with proper nesting
+    json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
+    json_matches = list(re.finditer(json_pattern, text, re.DOTALL))
+
+    json_matches.sort(key=lambda m: len(m.group(0)), reverse=True)
+
+    for match in json_matches:
+        try:
+            data = json.loads(match.group(0))
+            if 'nodes' in data and 'edges' in data:
+                if isinstance(data['nodes'], list) and isinstance(data['edges'], list):
+                    if len(data['nodes']) > 0:
+                        return match.group(0), match.group(0)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return None, None
+
+
+# ============================================================
+# System prompt builder (shared between sync and streaming paths)
+# ============================================================
+
+def _build_system_message(workflow_context: str) -> dict:
+    """Build the system prompt for the OpenAI conversation."""
+    return {
+        "role": "system",
+        "content": f"""You are a helpful assistant that helps companies design and visualize process workflows. You can communicate in English and Spanish.
+
+    When the user requests a workflow:
+    1. Provide a brief explanation of the workflow (1-3 sentences) in the user's language
+    2. ALWAYS include the workflow as valid JSON in this exact format: {{"nodes": [{{"id": "1", "label": "Step name", "type": "start|process|decision|end"}}], "edges": [{{"from": "1", "to": "2"}}]}}
+    3. NEVER return empty responses - always provide both explanation and JSON{workflow_context}
+
+    Guidelines:
+    - For NEW workflows: Create from scratch based on the user's description
+    - For UPDATES/MODIFICATIONS: 
+    * CRITICAL: START WITH THE CURRENT WORKFLOW JSON PROVIDED ABOVE
+    * ONLY modify the specific nodes/edges the user explicitly mentioned
+    * Copy all other nodes and edges EXACTLY as they appear in the current workflow
+    * Preserve all node IDs, labels, types, and edge connections that aren't being changed
+    * If updating ONE node label, copy all other nodes with identical IDs and labels
+    * If adding ONE node, copy the entire current workflow and append the new node with the next sequential ID
+    * If removing ONE node:
+      - Remove the node from the nodes array
+      - Remove all edges that connect to/from that node
+      - If removing a DECISION node that creates branches:
+        a) Find all nodes that were AFTER the decision (nodes that the decision pointed to)
+        b) Find what came BEFORE the decision (the parent node)
+        c) Connect the parent node directly to the FIRST branch path (skip the decision)
+        d) Merge the branches back into the main flow at their natural convergence point
+        e) Example: A→Decision→[B,C]→D becomes A→B→D (selecting primary branch)
+      - Ensure no orphaned nodes (nodes with no path from start)
+    * Think of it as copy-paste with minimal edits, not reconstruction
+    - Use sequential IDs starting from "1" for NEW workflows
+    - MUST include exactly one "start" node and at least one "end" node
+    - Use "decision" type for branching points (if/else scenarios)
+    - Ensure all edges connect existing node IDs
+    - Keep labels clear and concise (max 80 characters)
+    - Node labels must be based on user's language: either English or Spanish
+
+    IMPORTANT FOR MODIFICATIONS:
+    - When user says "change/cambiar X", "update/actualizar X", "modify/modificar X" - ONLY change X
+    - The current workflow is your STARTING POINT - copy it and make minimal edits
+    - Do not reorganize, renumber, reorder, or restructure unchanged parts
+    - Imagine you're using find-and-replace, not rewriting from scratch
+    - Preserve the exact structure and IDs from the current workflow
+    
+    SPECIAL CASE - Removing Decision Nodes:
+    - When removing a decision node, intelligently merge the branches:
+      1. Identify the parent node (what connects TO the decision)
+      2. Identify the child nodes (what the decision connects TO)
+      3. Choose the primary/main branch (usually the first/main path)
+      4. Create edge from parent → primary branch's first node
+      5. Keep the flow intact by maintaining downstream connections
+      6. Remove alternate branches only if they don't rejoin the main flow
+    - Goal: Maintain a coherent, linear flow after removing the decision point
+
+    CRITICAL: EVERY workflow request MUST include valid JSON with at least:
+    - One "start" node
+    - One "end" node  
+    - At least one connecting edge
+    - Proper node IDs (no duplicates)
+
+    Spanish keywords to recognize: flujo, diagrama, proceso, flujo de trabajo, flowchart
+    English keywords: workflow, flowchart, process, flow
+
+    ALWAYS provide both explanation AND valid JSON. Never provide responses without JSON when a workflow is requested."""
+    }
+
+
+def _build_conversation_history(messages, last_workflow_msg):
+    """Build conversation array and workflow context string from message history."""
+    conversation = []
+    for msg in messages:
+        if msg.role == "assistant" and msg.workflow_data:
+            content = f"{msg.content}\n\nCurrent workflow JSON:\n{msg.workflow_data}"
+            conversation.append({"role": msg.role, "content": content})
+        else:
+            conversation.append({"role": msg.role, "content": msg.content})
+
+    workflow_context = ""
+    if last_workflow_msg and last_workflow_msg.workflow_data:
+        workflow_context = (
+            f"\n\nCURRENT WORKFLOW (use this as your baseline for any modifications):\n"
+            f"{last_workflow_msg.workflow_data}\n\n"
+            f"When making changes, start with this exact workflow and ONLY modify what the user specifically requests."
+        )
+
+    return conversation, workflow_context
 
 
 # ============================================================
@@ -372,128 +506,40 @@ async def _generate_ai_response(
     db: Session
 ) -> Message:
     """Separated AI response logic so the lock wrapper stays clean."""
-    # Generate AI response
     try:
         from openai import OpenAI
         client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        timeout=120.0
+            api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=120.0
         )
-        
-        # Get conversation history to provide context
+
         messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.created_at).all()
-        
-        # Get the most recent workflow for context
         last_workflow_msg = db.query(Message).filter(
             Message.chat_id == chat_id,
             Message.role == "assistant",
             Message.workflow_data.isnot(None)
         ).order_by(Message.created_at.desc()).first()
-        
-        # Build conversation with workflow context
-        conversation = []
-        for msg in messages:
 
-            # For assistant messages with workflows, include the workflow in the content
-            if msg.role == "assistant" and msg.workflow_data:
-                # Include both the text and the workflow JSON in conversation
-                content = f"{msg.content}\n\nCurrent workflow JSON:\n{msg.workflow_data}"
-                conversation.append({"role": msg.role, "content": content})
-            else:
-                conversation.append({"role": msg.role, "content": msg.content})
-        
-        # Add system context about current workflow if it exists
-        workflow_context = ""
-        if last_workflow_msg and last_workflow_msg.workflow_data:
-            workflow_context = f"\n\nCURRENT WORKFLOW (use this as your baseline for any modifications):\n{last_workflow_msg.workflow_data}\n\nWhen making changes, start with this exact workflow and ONLY modify what the user specifically requests."
-        
-        # Prompt sent to the OpenAI API
-        system_message = {
-            "role": "system",
-            "content": f"""You are a helpful assistant that helps companies design and visualize process workflows. You can communicate in English and Spanish.
+        conversation, workflow_context = _build_conversation_history(messages, last_workflow_msg)
+        system_message = _build_system_message(workflow_context)
 
-        When the user requests a workflow:
-        1. Provide a brief explanation of the workflow (1-3 sentences) in the user's language
-        2. ALWAYS include the workflow as valid JSON in this exact format: {{"nodes": [{{"id": "1", "label": "Step name", "type": "start|process|decision|end"}}], "edges": [{{"from": "1", "to": "2"}}]}}
-        3. NEVER return empty responses - always provide both explanation and JSON{workflow_context}
-
-        Guidelines:
-        - For NEW workflows: Create from scratch based on the user's description
-        - For UPDATES/MODIFICATIONS: 
-        * CRITICAL: START WITH THE CURRENT WORKFLOW JSON PROVIDED ABOVE
-        * ONLY modify the specific nodes/edges the user explicitly mentioned
-        * Copy all other nodes and edges EXACTLY as they appear in the current workflow
-        * Preserve all node IDs, labels, types, and edge connections that aren't being changed
-        * If updating ONE node label, copy all other nodes with identical IDs and labels
-        * If adding ONE node, copy the entire current workflow and append the new node with the next sequential ID
-        * If removing ONE node:
-          - Remove the node from the nodes array
-          - Remove all edges that connect to/from that node
-          - If removing a DECISION node that creates branches:
-            a) Find all nodes that were AFTER the decision (nodes that the decision pointed to)
-            b) Find what came BEFORE the decision (the parent node)
-            c) Connect the parent node directly to the FIRST branch path (skip the decision)
-            d) Merge the branches back into the main flow at their natural convergence point
-            e) Example: A→Decision→[B,C]→D becomes A→B→D (selecting primary branch)
-          - Ensure no orphaned nodes (nodes with no path from start)
-        * Think of it as copy-paste with minimal edits, not reconstruction
-        - Use sequential IDs starting from "1" for NEW workflows
-        - MUST include exactly one "start" node and at least one "end" node
-        - Use "decision" type for branching points (if/else scenarios)
-        - Ensure all edges connect existing node IDs
-        - Keep labels clear and concise (max 80 characters)
-        - Node labels must be based on user's language: either English or Spanish
-
-        IMPORTANT FOR MODIFICATIONS:
-        - When user says "change/cambiar X", "update/actualizar X", "modify/modificar X" - ONLY change X
-        - The current workflow is your STARTING POINT - copy it and make minimal edits
-        - Do not reorganize, renumber, reorder, or restructure unchanged parts
-        - Imagine you're using find-and-replace, not rewriting from scratch
-        - Preserve the exact structure and IDs from the current workflow
-        
-        SPECIAL CASE - Removing Decision Nodes:
-        - When removing a decision node, intelligently merge the branches:
-          1. Identify the parent node (what connects TO the decision)
-          2. Identify the child nodes (what the decision connects TO)
-          3. Choose the primary/main branch (usually the first/main path)
-          4. Create edge from parent → primary branch's first node
-          5. Keep the flow intact by maintaining downstream connections
-          6. Remove alternate branches only if they don't rejoin the main flow
-        - Goal: Maintain a coherent, linear flow after removing the decision point
-
-        CRITICAL: EVERY workflow request MUST include valid JSON with at least:
-        - One "start" node
-        - One "end" node  
-        - At least one connecting edge
-        - Proper node IDs (no duplicates)
-
-        Spanish keywords to recognize: flujo, diagrama, proceso, flujo de trabajo, flowchart
-        English keywords: workflow, flowchart, process, flow
-
-        ALWAYS provide both explanation AND valid JSON. Never provide responses without JSON when a workflow is requested."""
-        }
-        
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[system_message] + conversation,
             max_completion_tokens=5000
         )
 
-        
         ai_content = response.choices[0].message.content
-        
-        # Better empty response handling with retry logic
+
         if not ai_content or len(ai_content.strip()) == 0:
             print("Warning: Empty response from AI, using fallback")
-            # Use the previous workflow if it exists instead of defaulting to empty
             prev_message = db.query(Message).filter(
                 Message.chat_id == chat_id,
                 Message.role == "assistant",
                 Message.workflow_data.isnot(None)
             ).order_by(Message.created_at.desc()).first()
-            
+
             if prev_message and prev_message.workflow_data:
-                # Return previous workflow with explanation
                 ai_message = Message(
                     chat_id=chat_id,
                     role="assistant",
@@ -508,77 +554,29 @@ async def _generate_ai_response(
                 return ai_message
             else:
                 raise Exception("Empty response from AI model and no previous workflow available")
-        
-        # Try to extract workflow data if present from the AI response
-        workflow_data = None
-        display_content = ai_content  # Content to display in chat
 
-        def extract_json_workflow(text: str):
-            """Try multiple methods to extract JSON workflow"""
-            
-            # Method 1: Look for JSON in code blocks (```json {...} ```)
-            code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-            if code_block_match:
-                try:
-                    data = json.loads(code_block_match.group(1))
-                    if 'nodes' in data and 'edges' in data:
-                        return code_block_match.group(1), code_block_match.group(0)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            
-            # Method 2: Look for JSON object anywhere with proper nesting
-            # More aggressive pattern to handle nested objects
-            json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
-            json_matches = list(re.finditer(json_pattern, text, re.DOTALL))
-            
-            # Try matches from largest to smallest (prefer complete objects)
-            json_matches.sort(key=lambda m: len(m.group(0)), reverse=True)
-            
-            for match in json_matches:
-                try:
-                    data = json.loads(match.group(0))
-                    if 'nodes' in data and 'edges' in data:
-                        # Verify nodes and edges are arrays
-                        if isinstance(data['nodes'], list) and isinstance(data['edges'], list):
-                            if len(data['nodes']) > 0:  # Ensure at least one node
-                                return match.group(0), match.group(0)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-            
-            return None, None
+        workflow_data = None
+        display_content = ai_content
 
         try:
             extracted_json, full_match = extract_json_workflow(ai_content)
-            
+
             if extracted_json:
                 workflow_data = extracted_json
-                print(f"Extracted workflow: {workflow_data}")
-                
-                # Validate JSON structure
                 parsed = json.loads(workflow_data)
                 if 'nodes' not in parsed or 'edges' not in parsed:
                     raise ValueError("Invalid workflow structure")
-                
-                # Verify we have actual content
                 if len(parsed['nodes']) == 0:
                     raise ValueError("Workflow has no nodes")
-                
-                # Remove the matched JSON from display
+
                 display_content = ai_content.replace(full_match, '').strip()
-                
-                # Clean up markdown artifacts
                 display_content = re.sub(r'```\s*```', '', display_content).strip()
                 display_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', display_content)
-                
-                # Default message if nothing left
+
                 if not display_content or len(display_content) < 10:
                     display_content = "I've created a workflow visualization for you based on your requirements. You can see it in the visualization panel on the right."
             else:
-                print("No valid workflow JSON found in response")
-                # If no JSON found but user requested a workflow, regenerate with stricter prompt
                 if any(keyword in message.content.lower() for keyword in ['workflow', 'flowchart', 'process', 'flujo', 'diagrama']):
-                    print("User requested workflow but AI didn't provide JSON - using fallback")
-                    # Create a simple fallback based on user's request
                     workflow_data = json.dumps({
                         "nodes": [
                             {"id": "1", "label": "Start", "type": "start"},
@@ -590,30 +588,27 @@ async def _generate_ai_response(
                             {"from": "2", "to": "3"}
                         ]
                     })
-                    display_content = ai_content if ai_content else "I've created a basic workflow structure for you. You can refine it by describing the specific steps you need."
+                    display_content = ai_content if ai_content else "I've created a basic workflow structure for you."
 
         except Exception as parse_error:
             print(f"JSON extraction error: {parse_error}")
             workflow_data = None
-        
-        # Save AI response
+
         ai_message = Message(
             chat_id=chat_id,
             role="assistant",
-            content=display_content,  # Use cleaned content without JSON
+            content=display_content,
             workflow_data=workflow_data
         )
         db.add(ai_message)
         db.commit()
         db.refresh(ai_message)
-        
+
         if ai_message.workflow_data:
             _ensure_workflow_state(chat_id, ai_message.workflow_data, current_user.id, db)
-        
-        # Get current workflow version for broadcast
+
         ws_state = db.query(WorkflowState).filter(WorkflowState.chat_id == chat_id).first()
-        
-        # Broadcast new messages to all connected users in this chat
+
         await manager.broadcast_to_chat(chat_id, {
             "type": "new_message",
             "chat_id": chat_id,
@@ -639,12 +634,11 @@ async def _generate_ai_response(
                 }
             ]
         }, exclude_user=current_user.id)
-        
+
         return ai_message
     except Exception as e:
-        # If OpenAI fails, an error log is printed, then a fallback response is returned
         print(f"OpenAI Error: {type(e).__name__}: {str(e)}")
-        
+
         fallback_workflow = json.dumps({
             "nodes": [
                 {"id": "1", "label": "Start", "type": "start"},
@@ -658,7 +652,7 @@ async def _generate_ai_response(
                 {"from": "3", "to": "4"}
             ]
         })
-        
+
         ai_message = Message(
             chat_id=chat_id,
             role="assistant",
@@ -668,12 +662,250 @@ async def _generate_ai_response(
         db.add(ai_message)
         db.commit()
         db.refresh(ai_message)
-        
+
         if ai_message.workflow_data:
             _ensure_workflow_state(chat_id, ai_message.workflow_data, current_user.id, db)
-        
+
         return ai_message
-    
+
+
+# ============================================================
+# Streaming Message Endpoint (SSE)
+# ============================================================
+
+@app.post("/chats/{chat_id}/messages/stream")
+async def stream_message(
+    chat_id: int,
+    message: MessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Send a message and receive the AI response as a Server-Sent Events stream.
+
+    Events emitted:
+      stream_start       – generation begins (includes user_message_id)
+      text_chunk         – a piece of the AI's text response
+      node_add           – a new workflow node was detected
+      edge_add           – a new workflow edge was detected
+      workflow_complete  – final validated workflow JSON + display text
+      stream_end         – generation finished (includes message_id, workflow_version)
+      error              – something went wrong
+    """
+    chat = get_chat_with_access(chat_id, current_user, db, require_role=None)
+
+    await chat_lock_manager.acquire(chat_id, current_user.id, current_user.username)
+
+    # Save user message BEFORE entering the async generator so the
+    # dependency-injected db session is still valid.
+    db.expire_all()
+    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+
+    user_message = Message(
+        chat_id=chat_id,
+        role="user",
+        content=message.content
+    )
+    db.add(user_message)
+    db.commit()
+    db.refresh(user_message)
+
+    if chat.title == "New Conversation":
+        message_count = db.query(Message).filter(Message.chat_id == chat_id).count()
+        if message_count == 1:
+            title = message.content[:50]
+            if len(message.content) > 50:
+                title = title.rsplit(' ', 1)[0] + "..."
+            chat.title = title
+            db.commit()
+
+    # Capture values the generator needs (the DI session may close).
+    user_id = current_user.id
+    username = current_user.username
+    user_msg_id = user_message.id
+    user_msg_content = user_message.content
+    user_msg_created_at = user_message.created_at
+    msg_content_lower = message.content.lower()
+
+    async def event_generator():
+        gen_db = SessionLocal()
+        try:
+            yield f"event: stream_start\ndata: {json.dumps({'user_message_id': user_msg_id})}\n\n"
+
+            # ----- build conversation context -----
+            all_messages = gen_db.query(Message).filter(
+                Message.chat_id == chat_id
+            ).order_by(Message.created_at).all()
+
+            last_workflow_msg = gen_db.query(Message).filter(
+                Message.chat_id == chat_id,
+                Message.role == "assistant",
+                Message.workflow_data.isnot(None)
+            ).order_by(Message.created_at.desc()).first()
+
+            conversation, workflow_context = _build_conversation_history(
+                all_messages, last_workflow_msg
+            )
+            system_msg = _build_system_message(workflow_context)
+
+            # ----- OpenAI streaming call (async to avoid blocking the event loop) -----
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                timeout=120.0
+            )
+
+            stream = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[system_msg] + conversation,
+                max_completion_tokens=5000,
+                stream=True
+            )
+
+            parser = IncrementalWorkflowParser()
+            full_content = ""
+
+            async for chunk in stream:
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice or not choice.delta or not choice.delta.content:
+                    continue
+
+                token = choice.delta.content
+                full_content += token
+
+                # Send text chunk
+                yield f"event: text_chunk\ndata: {json.dumps({'content': token})}\n\n"
+
+                # Detect newly completed nodes / edges
+                new_nodes, new_edges = parser.feed(token)
+                for node in new_nodes:
+                    yield f"event: node_add\ndata: {json.dumps({'node': node})}\n\n"
+                for edge in new_edges:
+                    yield f"event: edge_add\ndata: {json.dumps({'edge': edge})}\n\n"
+
+            # ----- post-stream processing -----
+            if not full_content or len(full_content.strip()) == 0:
+                prev_msg = gen_db.query(Message).filter(
+                    Message.chat_id == chat_id,
+                    Message.role == "assistant",
+                    Message.workflow_data.isnot(None)
+                ).order_by(Message.created_at.desc()).first()
+
+                if prev_msg and prev_msg.workflow_data:
+                    workflow_data = prev_msg.workflow_data
+                    display_content = "I apologize, I encountered an issue. I've kept your previous workflow intact."
+                else:
+                    yield f"event: error\ndata: {json.dumps({'error': 'Empty AI response'})}\n\n"
+                    return
+            else:
+                workflow_data = None
+                display_content = full_content
+
+                try:
+                    extracted_json, full_match = extract_json_workflow(full_content)
+                    if extracted_json:
+                        workflow_data = extracted_json
+                        parsed = json.loads(workflow_data)
+                        if 'nodes' not in parsed or 'edges' not in parsed or len(parsed['nodes']) == 0:
+                            raise ValueError("Invalid workflow structure")
+
+                        display_content = full_content.replace(full_match, '').strip()
+                        display_content = re.sub(r'```\s*```', '', display_content).strip()
+                        display_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', display_content)
+                        if not display_content or len(display_content) < 10:
+                            display_content = "I've created a workflow visualization for you based on your requirements."
+                    else:
+                        if any(kw in msg_content_lower for kw in ['workflow', 'flowchart', 'process', 'flujo', 'diagrama']):
+                            workflow_data = json.dumps({
+                                "nodes": [
+                                    {"id": "1", "label": "Start", "type": "start"},
+                                    {"id": "2", "label": "Process request", "type": "process"},
+                                    {"id": "3", "label": "Complete", "type": "end"}
+                                ],
+                                "edges": [
+                                    {"from": "1", "to": "2"},
+                                    {"from": "2", "to": "3"}
+                                ]
+                            })
+                            display_content = full_content if full_content.strip() else "I've created a basic workflow."
+                except Exception as parse_err:
+                    print(f"Stream JSON extraction error: {parse_err}")
+                    workflow_data = None
+
+            # ----- persist assistant message -----
+            ai_message = Message(
+                chat_id=chat_id,
+                role="assistant",
+                content=display_content,
+                workflow_data=workflow_data
+            )
+            gen_db.add(ai_message)
+            gen_db.commit()
+            gen_db.refresh(ai_message)
+
+            if ai_message.workflow_data:
+                _ensure_workflow_state(chat_id, ai_message.workflow_data, user_id, gen_db)
+
+            ws_state = gen_db.query(WorkflowState).filter(
+                WorkflowState.chat_id == chat_id
+            ).first()
+
+            # Send the final workflow (validated & cleaned)
+            yield (
+                f"event: workflow_complete\n"
+                f"data: {json.dumps({'workflow_data': workflow_data, 'display_content': display_content})}\n\n"
+            )
+
+            yield (
+                f"event: stream_end\n"
+                f"data: {json.dumps({'message_id': ai_message.id, 'workflow_version': ws_state.version if ws_state else None})}\n\n"
+            )
+
+            # ----- broadcast to collaborators via WebSocket -----
+            await manager.broadcast_to_chat(chat_id, {
+                "type": "new_message",
+                "chat_id": chat_id,
+                "sender_id": user_id,
+                "sender_username": username,
+                "workflow_version": ws_state.version if ws_state else None,
+                "messages": [
+                    {
+                        "id": user_msg_id,
+                        "chat_id": chat_id,
+                        "role": "user",
+                        "content": user_msg_content,
+                        "workflow_data": None,
+                        "created_at": user_msg_created_at.isoformat()
+                    },
+                    {
+                        "id": ai_message.id,
+                        "chat_id": chat_id,
+                        "role": "assistant",
+                        "content": ai_message.content,
+                        "workflow_data": ai_message.workflow_data,
+                        "created_at": ai_message.created_at.isoformat()
+                    }
+                ]
+            }, exclude_user=user_id)
+
+        except Exception as e:
+            print(f"Streaming error: {type(e).__name__}: {str(e)}")
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            gen_db.close()
+            await chat_lock_manager.release(chat_id)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 # Endpoint to update workflow data and position for a message
 @app.patch("/messages/{message_id}/workflow")
 async def update_workflow(
